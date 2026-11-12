@@ -14,10 +14,12 @@ from .parser import (
     CreateIndexStmt,
     CreateTableStmt,
     DeleteStmt,
+    ExplainStmt,
     InsertStmt,
     SelectItem,
     SelectStmt,
     UpdateStmt,
+    VacuumStmt,
     WhereClause,
     parse_query,
 )
@@ -77,15 +79,13 @@ class MiniDB:
         self.wal = WriteAheadLog(os.path.join(self.db_dir, "minidb.wal"))
         self.rwlock = ReadWriteLock()
 
-        # In-memory state synchronized with binary disk storage
         self.schemas: Dict[str, TableSchema] = {}
         self.next_rids: Dict[str, int] = {}
-        self.tables: Dict[str, Dict[int, Dict[str, Any]]] = {}  # table -> {rid: record}
-        self.offsets: Dict[str, Dict[int, int]] = {}  # table -> {rid: byte_offset}
-        self.indexes: Dict[str, Dict[str, BaseIndex]] = {}  # table -> {col_name: BaseIndex}
-        self.index_meta: List[Dict[str, str]] = []  # persisted index definitions
+        self.tables: Dict[str, Dict[int, Dict[str, Any]]] = {}
+        self.offsets: Dict[str, Dict[int, int]] = {}
+        self.indexes: Dict[str, Dict[str, BaseIndex]] = {}
+        self.index_meta: List[Dict[str, str]] = []
 
-        # Active explicit transaction state (per-thread safe via local storage)
         self._tx_local = threading.local()
         self.last_recovery_stats: Dict[str, Any] = {}
 
@@ -98,10 +98,6 @@ class MiniDB:
         self._tx_local.tx = state
 
     def _startup_and_recover(self) -> None:
-        """
-        Loads persisted binary tables and replays committed WAL entries while
-        discarding uncommitted/crashed transactions.
-        """
         self.schemas, self.next_rids = self.storage.load_catalog()
 
         for table_name in self.schemas:
@@ -115,7 +111,6 @@ class MiniDB:
             with open(idx_meta_path, "r", encoding="utf-8") as f:
                 self.index_meta = json.load(f)
 
-        # Replay committed WAL operations for durability & crash recovery
         committed_ops, discarded_uncommitted = self.wal.read_committed_operations()
 
         for entry in committed_ops:
@@ -142,7 +137,6 @@ class MiniDB:
                 rec = entry["before"]
                 self.tables[tbl].pop(rec["_rid"], None)
 
-        # Checkpoint clean state back to binary files & truncate WAL
         for tbl, rec_map in self.tables.items():
             ordered_recs = [rec_map[k] for k in sorted(rec_map.keys())]
             self.offsets[tbl] = self.storage.rewrite_table(tbl, ordered_recs)
@@ -150,7 +144,6 @@ class MiniDB:
         self.storage.save_catalog(self.schemas, self.next_rids)
         self.wal.truncate()
 
-        # Rebuild all registered indexes from clean recovered data
         for meta in self.index_meta:
             tbl = meta["table_name"]
             col = meta["column_name"]
@@ -193,8 +186,8 @@ class MiniDB:
         self.wal.append(tx_id=tx_id, op="BEGIN")
         self._set_tx_state({
             "tx_id": tx_id,
-            "undo_log": [],     # In-memory undo steps if rollback() is called
-            "disk_writes": [],  # Staged binary disk operations flushed ONLY on commit()
+            "undo_log": [],
+            "disk_writes": [],
             "catalog_changed": False,
         })
         return tx_id
@@ -204,10 +197,8 @@ class MiniDB:
         if tx is None:
             raise TransactionError("No active transaction to commit.")
 
-        # 1. Write COMMIT record to WAL first (durability guarantee)
         self.wal.append(tx_id=tx["tx_id"], op="COMMIT")
 
-        # 2. Flush staged binary record writes to .mdb files
         for disk_op, tbl, rid, rec in tx["disk_writes"]:
             if disk_op == "APPEND":
                 offset = self.storage.append_record(tbl, rec)
@@ -227,7 +218,6 @@ class MiniDB:
         if tx is None:
             raise TransactionError("No active transaction to rollback.")
 
-        # Revert in-memory tables and indexes in reverse order (.mdb files were never modified!)
         for action, tbl, rid, old_rec in reversed(tx["undo_log"]):
             if action == "UNDO_INSERT":
                 rec = self.tables[tbl].pop(rid, None)
@@ -279,6 +269,12 @@ class MiniDB:
         if isinstance(stmt, SelectStmt):
             with self.rwlock.read_lock():
                 result = self._exec_select(stmt)
+        elif isinstance(stmt, ExplainStmt):
+            with self.rwlock.read_lock():
+                result = self._exec_explain(stmt)
+        elif isinstance(stmt, VacuumStmt):
+            with self.rwlock.write_lock():
+                result = self._exec_vacuum(stmt)
         else:
             with self.rwlock.write_lock():
                 auto_tx = self._get_tx_state() is None
@@ -308,6 +304,49 @@ class MiniDB:
         elapsed_ms = round((time.perf_counter() - start_time) * 1000, 4)
         result.setdefault("stats", {})["execution_time_ms"] = elapsed_ms
         return result
+
+    # --- Utility & Maintenance Executors ---
+
+    def _exec_explain(self, stmt: ExplainStmt) -> Dict[str, Any]:
+        sel = stmt.select_stmt
+        if sel.table_name not in self.schemas:
+            raise ExecutionError(f"Table '{sel.table_name}' does not exist.")
+        table_map = self.tables[sel.table_name]
+        table_indexes = self.indexes.get(sel.table_name, {})
+        plan = QueryPlanner.choose_plan(len(table_map), sel.where, table_indexes)
+        est_scan = len(plan["candidate_rids"]) if plan["candidate_rids"] is not None else len(table_map)
+        return {
+            "status": "OK",
+            "plan": {
+                "strategy": plan["strategy"],
+                "index_used": plan["index_used"],
+                "estimated_records_to_scan": est_scan,
+                "total_table_records": len(table_map),
+                "reason": plan["reason"],
+            },
+        }
+
+    def _exec_vacuum(self, stmt: VacuumStmt) -> Dict[str, Any]:
+        if self._get_tx_state() is not None:
+            raise TransactionError("VACUUM cannot run inside an active transaction.")
+        if stmt.table_name not in self.schemas:
+            raise ExecutionError(f"Table '{stmt.table_name}' does not exist.")
+
+        mdb_path = self.storage._table_file(stmt.table_name)
+        bytes_before = os.path.getsize(mdb_path) if os.path.exists(mdb_path) else 0
+
+        rec_map = self.tables[stmt.table_name]
+        ordered_recs = [rec_map[k] for k in sorted(rec_map.keys())]
+        self.offsets[stmt.table_name] = self.storage.rewrite_table(stmt.table_name, ordered_recs)
+
+        bytes_after = os.path.getsize(mdb_path) if os.path.exists(mdb_path) else 0
+        return {
+            "status": "OK",
+            "message": f"Compacted table '{stmt.table_name}'.",
+            "bytes_before": bytes_before,
+            "bytes_after": bytes_after,
+            "bytes_reclaimed": max(0, bytes_before - bytes_after),
+        }
 
     # --- DDL & DML Executors ---
 

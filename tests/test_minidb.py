@@ -6,7 +6,7 @@ import tempfile
 import threading
 import unittest
 
-from minidb import MiniDB, QuerySyntaxError, SchemaError, TransactionError
+from minidb import CorruptionError, MiniDB, QuerySyntaxError, SchemaError
 
 
 class TestMiniDB(unittest.TestCase):
@@ -22,13 +22,12 @@ class TestMiniDB(unittest.TestCase):
         self.db.execute("INSERT INTO users VALUES (1, 'Alice', 95.5, TRUE)")
         self.db.execute("INSERT INTO users VALUES (2, 'Bob', 82.0, FALSE)")
 
-        # Constraint checks
         with self.assertRaises(SchemaError):
-            self.db.execute("INSERT INTO users VALUES (1, 'DupID', 70.0, TRUE)")  # UNIQUE violation
+            self.db.execute("INSERT INTO users VALUES (1, 'DupID', 70.0, TRUE)")
         with self.assertRaises(SchemaError):
-            self.db.execute("INSERT INTO users VALUES (3, NULL, 70.0, TRUE)")  # NOT NULL violation
+            self.db.execute("INSERT INTO users VALUES (3, NULL, 70.0, TRUE)")
         with self.assertRaises(SchemaError):
-            self.db.execute("INSERT INTO users VALUES ('bad_int', 'Eve', 70.0, TRUE)")  # Type mismatch
+            self.db.execute("INSERT INTO users VALUES ('bad_int', 'Eve', 70.0, TRUE)")
 
         res = self.db.execute("SELECT name, score FROM users WHERE active = TRUE")
         self.assertEqual(res["rows"], [{"name": "Alice", "score": 95.5}])
@@ -62,23 +61,57 @@ class TestMiniDB(unittest.TestCase):
         self.assertEqual(res["rows"][0]["SUM(amount)"], 300.0)
         self.assertEqual(res["rows"][0]["AVG(amount)"], 150.0)
 
-    def test_indexing_and_query_planner(self):
+    def test_indexing_explain_and_query_planner(self):
         self.db.execute("CREATE TABLE items (id INT UNIQUE, category STR, price INT)")
         for i in range(1, 101):
             cat = "Books" if i % 2 == 0 else "Tech"
             self.db.execute(f"INSERT INTO items VALUES ({i}, '{cat}', {i * 10})")
 
-        # Before index on price -> FULL_TABLE_SCAN
-        no_idx = self.db.execute("SELECT id FROM items WHERE price > 900")
-        self.assertEqual(no_idx["stats"]["strategy"], "FULL_TABLE_SCAN")
-        self.assertEqual(no_idx["stats"]["records_scanned"], 100)
+        plan_before = self.db.execute("EXPLAIN SELECT id FROM items WHERE price > 900")
+        self.assertEqual(plan_before["plan"]["strategy"], "FULL_TABLE_SCAN")
 
-        # Create B-Tree range index on price -> INDEX_SCAN
         self.db.execute("CREATE INDEX idx_price ON items (price) USING BTREE")
+        plan_after = self.db.execute("EXPLAIN SELECT id FROM items WHERE price > 900")
+        self.assertEqual(plan_after["plan"]["strategy"], "INDEX_SCAN")
+        self.assertEqual(plan_after["plan"]["estimated_records_to_scan"], 10)
+
         with_idx = self.db.execute("SELECT id FROM items WHERE price > 900")
         self.assertEqual(with_idx["stats"]["strategy"], "INDEX_SCAN")
         self.assertEqual(with_idx["stats"]["records_scanned"], 10)
         self.assertEqual(len(with_idx["rows"]), 10)
+
+    def test_vacuum_compaction_and_crc_corruption_detection(self):
+        self.db.execute("CREATE TABLE logs (id INT UNIQUE, msg STR)")
+        for i in range(1, 11):
+            self.db.execute(f"INSERT INTO logs VALUES ({i}, 'log_entry_{i}')")
+        self.db.execute("DELETE FROM logs WHERE id <= 8")
+
+        vac = self.db.execute("VACUUM logs")
+        self.assertGreater(vac["bytes_reclaimed"], 0)
+        self.assertEqual(len(self.db.execute("SELECT * FROM logs")["rows"]), 2)
+
+        # Simulate bit-rot / disk corruption in binary .mdb file
+        mdb_file = os.path.join(self.test_dir, "logs.mdb")
+        with open(mdb_file, "r+b") as f:
+            data = bytearray(f.read())
+            data[-1] ^= 0xFF  # Flip bits in the last byte
+            f.seek(0)
+            f.write(data)
+
+        with self.assertRaises(CorruptionError):
+            MiniDB(self.test_dir)
+
+    def test_adversarial_edge_cases(self):
+        self.db.execute("CREATE TABLE edge (id INT UNIQUE, val FLOAT, tag STR);")
+        self.db.execute("INSERT INTO edge VALUES (1, -42.5, 'neg');")
+        self.db.execute("INSERT INTO edge VALUES (2, NULL, 'empty');")
+        self.db.execute("INSERT INTO edge VALUES (3, 100.0, 'pos');")
+
+        res = self.db.execute("SELECT id FROM edge WHERE val < 0 OR val > 50 ORDER BY val ASC;")
+        self.assertEqual(res["rows"], [{"id": 1}, {"id": 3}])
+
+        with self.assertRaises(QuerySyntaxError):
+            self.db.execute("INVALID COMMAND FROM edge")
 
     def test_transactions_and_rollback(self):
         self.db.execute("CREATE TABLE accounts (id INT UNIQUE, balance INT)")
@@ -95,11 +128,9 @@ class TestMiniDB(unittest.TestCase):
         self.assertEqual(res["rows"][0]["balance"], 500)
 
     def test_crash_recovery_sigkill(self):
-        # 1. Commit baseline data
         self.db.execute("CREATE TABLE ledger (id INT UNIQUE, note STR)")
         self.db.execute("INSERT INTO ledger VALUES (1, 'committed_row')")
 
-        # 2. Spawn child process that starts a txn, inserts uncommitted rows, and hard-kills itself
         crash_script = (
             "import os, signal; "
             "from minidb import MiniDB; "
@@ -111,7 +142,6 @@ class TestMiniDB(unittest.TestCase):
         proc = subprocess.run([sys.executable, "-c", crash_script])
         self.assertNotEqual(proc.returncode, 0)
 
-        # 3. Reopen database -> uncommitted row must be discarded, committed row preserved
         recovered_db = MiniDB(self.test_dir)
         self.assertEqual(recovered_db.last_recovery_stats["discarded_uncommitted_txns"], 1)
         res = recovered_db.execute("SELECT * FROM ledger")

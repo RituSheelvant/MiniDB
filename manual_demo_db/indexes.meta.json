@@ -4,5 +4,11 @@
     "table_name": "students",
     "column_name": "id",
     "index_type": "HASH"
+  },
+  {
+    "index_name": "uq_accounts_id",
+    "table_name": "accounts",
+    "column_name": "id",
+    "index_type": "HASH"
   }
 ]

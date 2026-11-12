@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 from .errors import QuerySyntaxError
 
-# Token specification (order matters)
 TOKEN_SPEC = [
     ("FLOAT", r"-?\d+\.\d+"),
     ("INT", r"-?\d+"),
@@ -27,6 +26,7 @@ KEYWORDS = {
     "SELECT", "FROM", "WHERE", "AND", "OR",
     "GROUP", "BY", "ORDER", "ASC", "DESC", "LIMIT",
     "UPDATE", "SET", "DELETE",
+    "EXPLAIN", "VACUUM",
     "INT", "FLOAT", "STR", "BOOL",
     "NOT", "NULL", "UNIQUE", "TRUE", "FALSE",
     "COUNT", "SUM", "AVG", "MIN", "MAX",
@@ -75,7 +75,7 @@ def tokenize(query: str) -> List[Token]:
 @dataclass
 class CreateTableStmt:
     table_name: str
-    columns: List[Tuple[str, str, bool, bool]]  # (name, type, not_null, unique)
+    columns: List[Tuple[str, str, bool, bool]]
 
 
 @dataclass
@@ -83,7 +83,7 @@ class CreateIndexStmt:
     index_name: str
     table_name: str
     column_name: str
-    index_type: str  # "BTREE" or "HASH"
+    index_type: str
 
 
 @dataclass
@@ -103,14 +103,14 @@ class Condition:
 @dataclass
 class WhereClause:
     conditions: List[Condition]
-    connectors: List[str]  # "AND" / "OR" between conditions
+    connectors: List[str]
 
 
 @dataclass
 class SelectItem:
-    expr_type: str  # "STAR", "COLUMN", "AGG"
+    expr_type: str
     field: Optional[str]
-    func: Optional[str] = None  # COUNT, SUM, AVG, MIN, MAX
+    func: Optional[str] = None
     alias: Optional[str] = None
 
 
@@ -120,7 +120,7 @@ class SelectStmt:
     table_name: str
     where: Optional[WhereClause]
     group_by: Optional[str]
-    order_by: Optional[Tuple[str, bool]]  # (field_or_alias, is_desc)
+    order_by: Optional[Tuple[str, bool]]
     limit: Optional[int]
 
 
@@ -135,6 +135,16 @@ class UpdateStmt:
 class DeleteStmt:
     table_name: str
     where: Optional[WhereClause]
+
+
+@dataclass
+class ExplainStmt:
+    select_stmt: SelectStmt
+
+
+@dataclass
+class VacuumStmt:
+    table_name: str
 
 
 class Parser:
@@ -183,6 +193,13 @@ class Parser:
             stmt = self._parse_update()
         elif cmd == "DELETE":
             stmt = self._parse_delete()
+        elif cmd == "EXPLAIN":
+            self.advance()
+            stmt = ExplainStmt(select_stmt=self._parse_select())
+        elif cmd == "VACUUM":
+            self.advance()
+            table_name = self.expect_type("IDENT").value
+            stmt = VacuumStmt(table_name=table_name)
         else:
             raise QuerySyntaxError(f"Unsupported statement starting with '{cmd}'.")
 
@@ -229,7 +246,7 @@ class Parser:
                     elif self.match_keyword("UNIQUE"):
                         unique = True
                 cols.append((col_name, type_tok.value, not_null, unique))
-                if not self.match_keyword(",") and self.current().type == "COMMA":
+                if self.current().type == "COMMA":
                     self.advance()
                 else:
                     break
