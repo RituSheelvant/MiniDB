@@ -80,6 +80,58 @@ class TestMiniDB(unittest.TestCase):
         self.assertEqual(with_idx["stats"]["records_scanned"], 10)
         self.assertEqual(len(with_idx["rows"]), 10)
 
+    def test_composite_indexes_and_or_index_unions(self):
+        self.db.execute("CREATE TABLE events (id INT UNIQUE, service STR, severity INT)")
+        for i in range(1, 61):
+            svc = ["auth", "billing", "search"][i % 3]
+            sev = (i % 5) + 1
+            self.db.execute(f"INSERT INTO events VALUES ({i}, '{svc}', {sev})")
+
+        # 1. Composite multi-column index (service, severity)
+        self.db.execute("CREATE INDEX idx_svc_sev ON events (service, severity) USING BTREE")
+        comp_res = self.db.execute("SELECT id FROM events WHERE service = 'auth' AND severity = 5")
+        self.assertEqual(comp_res["stats"]["strategy"], "INDEX_SCAN")
+        self.assertIn("idx_svc_sev", comp_res["stats"]["index_used"])
+        self.assertEqual(len(comp_res["rows"]), 4)
+
+        # 2. OR Index Union across single-column index
+        self.db.execute("CREATE INDEX idx_sev ON events (severity) USING HASH")
+        or_res = self.db.execute("SELECT id FROM events WHERE severity = 1 OR severity = 5")
+        self.assertEqual(or_res["stats"]["strategy"], "INDEX_UNION_SCAN")
+        self.assertEqual(or_res["stats"]["records_scanned"], 24)
+        self.assertEqual(len(or_res["rows"]), 24)
+
+    def test_inner_joins_index_and_hash(self):
+        self.db.execute("CREATE TABLE customers (id INT UNIQUE, name STR, tier STR)")
+        self.db.execute("CREATE TABLE orders (oid INT UNIQUE, cust_id INT, total FLOAT)")
+
+        self.db.execute("INSERT INTO customers VALUES (1, 'Aarav', 'Gold')")
+        self.db.execute("INSERT INTO customers VALUES (2, 'Diya', 'Silver')")
+        self.db.execute("INSERT INTO orders VALUES (101, 1, 250.0)")
+        self.db.execute("INSERT INTO orders VALUES (102, 1, 150.0)")
+        self.db.execute("INSERT INTO orders VALUES (103, 2, 500.0)")
+
+        # Hash Join (cust_id has no index yet)
+        hj = self.db.execute(
+            "SELECT customers.name, SUM(orders.total) FROM customers "
+            "JOIN orders ON customers.id = orders.cust_id "
+            "GROUP BY customers.name ORDER BY SUM(orders.total) DESC"
+        )
+        self.assertEqual(hj["stats"]["strategy"], "HASH_JOIN")
+        self.assertEqual(hj["rows"][0], {"customers.name": "Diya", "SUM(orders.total)": 500.0})
+        self.assertEqual(hj["rows"][1], {"customers.name": "Aarav", "SUM(orders.total)": 400.0})
+
+        # Index Nested-Loop Join (after indexing orders.cust_id)
+        self.db.execute("CREATE INDEX idx_cust_id ON orders (cust_id) USING HASH")
+        inlj = self.db.execute(
+            "SELECT customers.name, orders.total FROM customers "
+            "INNER JOIN orders ON customers.id = orders.cust_id "
+            "WHERE customers.tier = 'Gold' ORDER BY orders.total ASC"
+        )
+        self.assertEqual(inlj["stats"]["strategy"], "INDEX_NESTED_LOOP_JOIN")
+        self.assertEqual(len(inlj["rows"]), 2)
+        self.assertEqual(inlj["rows"][0]["orders.total"], 150.0)
+
     def test_vacuum_compaction_and_crc_corruption_detection(self):
         self.db.execute("CREATE TABLE logs (id INT UNIQUE, msg STR)")
         for i in range(1, 11):
@@ -90,11 +142,10 @@ class TestMiniDB(unittest.TestCase):
         self.assertGreater(vac["bytes_reclaimed"], 0)
         self.assertEqual(len(self.db.execute("SELECT * FROM logs")["rows"]), 2)
 
-        # Simulate bit-rot / disk corruption in binary .mdb file
         mdb_file = os.path.join(self.test_dir, "logs.mdb")
         with open(mdb_file, "r+b") as f:
             data = bytearray(f.read())
-            data[-1] ^= 0xFF  # Flip bits in the last byte
+            data[-1] ^= 0xFF
             f.seek(0)
             f.write(data)
 

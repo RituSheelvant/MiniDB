@@ -9,6 +9,7 @@ TOKEN_SPEC = [
     ("STRING", r"'([^']*)'"),
     ("OP", r"!=|<=|>=|=|<|>"),
     ("COMMA", r","),
+    ("DOT", r"\."),
     ("SEMI", r";"),
     ("LPAREN", r"\("),
     ("RPAREN", r"\)"),
@@ -23,7 +24,7 @@ MASTER_REGEX = re.compile("|".join(f"(?P<{name}>{pattern})" for name, pattern in
 KEYWORDS = {
     "CREATE", "TABLE", "INDEX", "ON", "USING",
     "INSERT", "INTO", "VALUES",
-    "SELECT", "FROM", "WHERE", "AND", "OR",
+    "SELECT", "FROM", "JOIN", "INNER", "WHERE", "AND", "OR",
     "GROUP", "BY", "ORDER", "ASC", "DESC", "LIMIT",
     "UPDATE", "SET", "DELETE",
     "EXPLAIN", "VACUUM",
@@ -82,7 +83,7 @@ class CreateTableStmt:
 class CreateIndexStmt:
     index_name: str
     table_name: str
-    column_name: str
+    columns: List[str]
     index_type: str
 
 
@@ -107,6 +108,13 @@ class WhereClause:
 
 
 @dataclass
+class JoinClause:
+    right_table: str
+    left_col: str
+    right_col: str
+
+
+@dataclass
 class SelectItem:
     expr_type: str
     field: Optional[str]
@@ -118,6 +126,7 @@ class SelectItem:
 class SelectStmt:
     items: List[SelectItem]
     table_name: str
+    join: Optional[JoinClause]
     where: Optional[WhereClause]
     group_by: Optional[str]
     order_by: Optional[Tuple[str, bool]]
@@ -176,6 +185,15 @@ class Parser:
         if self.current().type == tok_type:
             return self.advance()
         raise QuerySyntaxError(f"Expected {tok_type}, got {self.current().type} ({self.current().value!r}) at pos {self.current().pos}.")
+
+    def _parse_col_ref(self) -> str:
+        """Parses 'col' or 'table.col'."""
+        first = self.expect_type("IDENT").value
+        if self.current().type == "DOT":
+            self.advance()
+            second = self.expect_type("IDENT").value
+            return f"{first}.{second}"
+        return first
 
     def parse(self) -> Any:
         tok = self.current()
@@ -258,7 +276,13 @@ class Parser:
             self.expect_keyword("ON")
             table_name = self.expect_type("IDENT").value
             self.expect_type("LPAREN")
-            col_name = self.expect_type("IDENT").value
+            idx_cols: List[str] = []
+            while True:
+                idx_cols.append(self.expect_type("IDENT").value)
+                if self.current().type == "COMMA":
+                    self.advance()
+                else:
+                    break
             self.expect_type("RPAREN")
             index_type = "BTREE"
             if self.match_keyword("USING"):
@@ -266,7 +290,7 @@ class Parser:
                 index_type = idx_tok.value.upper()
                 if index_type not in ("BTREE", "HASH"):
                     raise QuerySyntaxError(f"Index type must be BTREE or HASH, got {index_type!r}.")
-            return CreateIndexStmt(index_name=index_name, table_name=table_name, column_name=col_name, index_type=index_type)
+            return CreateIndexStmt(index_name=index_name, table_name=table_name, columns=idx_cols, index_type=index_type)
 
         raise QuerySyntaxError("Expected TABLE or INDEX after CREATE.")
 
@@ -306,7 +330,7 @@ class Parser:
         connectors: List[str] = []
 
         while True:
-            field = self.expect_type("IDENT").value
+            field = self._parse_col_ref()
             op_tok = self.expect_type("OP")
             val = self._parse_literal()
             conditions.append(Condition(field=field, op=op_tok.value, value=val))
@@ -333,12 +357,12 @@ class Parser:
                     self.advance()
                     field = "*"
                 else:
-                    field = self.expect_type("IDENT").value
+                    field = self._parse_col_ref()
                 self.expect_type("RPAREN")
                 alias = f"{func}({field})"
                 items.append(SelectItem(expr_type="AGG", field=field, func=func, alias=alias))
             else:
-                field = self.expect_type("IDENT").value
+                field = self._parse_col_ref()
                 items.append(SelectItem(expr_type="COLUMN", field=field, alias=field))
 
             if self.current().type == "COMMA":
@@ -348,12 +372,25 @@ class Parser:
 
         self.expect_keyword("FROM")
         table_name = self.expect_type("IDENT").value
+
+        join: Optional[JoinClause] = None
+        if self.match_keyword("INNER") or (self.current().type == "KEYWORD" and self.current().value == "JOIN"):
+            self.expect_keyword("JOIN")
+            right_table = self.expect_type("IDENT").value
+            self.expect_keyword("ON")
+            left_col = self._parse_col_ref()
+            op = self.expect_type("OP")
+            if op.value != "=":
+                raise QuerySyntaxError(f"JOIN ON clause only supports '=' equality, got {op.value!r}.")
+            right_col = self._parse_col_ref()
+            join = JoinClause(right_table=right_table, left_col=left_col, right_col=right_col)
+
         where = self._parse_where()
 
         group_by: Optional[str] = None
         if self.match_keyword("GROUP"):
             self.expect_keyword("BY")
-            group_by = self.expect_type("IDENT").value
+            group_by = self._parse_col_ref()
 
         order_by: Optional[Tuple[str, bool]] = None
         if self.match_keyword("ORDER"):
@@ -361,13 +398,15 @@ class Parser:
             if self.current().type == "KEYWORD" and self.current().value in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
                 func = self.advance().value
                 self.expect_type("LPAREN")
-                inner = "*" if self.current().type == "STAR" else self.expect_type("IDENT").value
                 if self.current().type == "STAR":
                     self.advance()
+                    inner = "*"
+                else:
+                    inner = self._parse_col_ref()
                 self.expect_type("RPAREN")
                 sort_field = f"{func}({inner})"
             else:
-                sort_field = self.expect_type("IDENT").value
+                sort_field = self._parse_col_ref()
 
             is_desc = False
             if self.match_keyword("DESC"):
@@ -383,6 +422,7 @@ class Parser:
         return SelectStmt(
             items=items,
             table_name=table_name,
+            join=join,
             where=where,
             group_by=group_by,
             order_by=order_by,
