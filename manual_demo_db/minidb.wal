@@ -1,0 +1,12 @@
+813624e5|{"tx_id":"3671b0c4-3506-4cf3-a39a-4574d399bbf3","op":"BEGIN","table":null,"before":null,"after":null,"schema":null}
+f8519164|{"tx_id":"3671b0c4-3506-4cf3-a39a-4574d399bbf3","op":"INSERT","table":"students","before":null,"after":{"id":2,"name":"Riya","marks":88,"_rid":2},"schema":null}
+71dc262a|{"tx_id":"3671b0c4-3506-4cf3-a39a-4574d399bbf3","op":"COMMIT","table":null,"before":null,"after":null,"schema":null}
+a44e7770|{"tx_id":"dcd62633-201f-4374-ab1e-56d7970ea293","op":"BEGIN","table":null,"before":null,"after":null,"schema":null}
+f586b8bd|{"tx_id":"dcd62633-201f-4374-ab1e-56d7970ea293","op":"INSERT","table":"students","before":null,"after":{"id":3,"name":"Aman","marks":92,"_rid":3},"schema":null}
+f19c39b2|{"tx_id":"dcd62633-201f-4374-ab1e-56d7970ea293","op":"COMMIT","table":null,"before":null,"after":null,"schema":null}
+759a3e25|{"tx_id":"7f022a63-61b2-4ff5-bf48-53e7e47566d7","op":"BEGIN","table":null,"before":null,"after":null,"schema":null}
+03afd53f|{"tx_id":"7f022a63-61b2-4ff5-bf48-53e7e47566d7","op":"UPDATE","table":"students","before":{"id":1,"name":"Sheel","marks":95,"_rid":1},"after":{"id":1,"name":"Sheel","marks":99,"_rid":1},"schema":null}
+ea4c4880|{"tx_id":"7f022a63-61b2-4ff5-bf48-53e7e47566d7","op":"COMMIT","table":null,"before":null,"after":null,"schema":null}
+c9a78c5d|{"tx_id":"7fb04588-2e31-4225-9e41-7b5cb83d1e54","op":"BEGIN","table":null,"before":null,"after":null,"schema":null}
+daaf520b|{"tx_id":"7fb04588-2e31-4225-9e41-7b5cb83d1e54","op":"DELETE","table":"students","before":{"id":3,"name":"Aman","marks":92,"_rid":3},"after":null,"schema":null}
+b42e8c3c|{"tx_id":"7fb04588-2e31-4225-9e41-7b5cb83d1e54","op":"COMMIT","table":null,"before":null,"after":null,"schema":null}

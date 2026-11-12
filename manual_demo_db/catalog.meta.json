@@ -1,0 +1,30 @@
+{
+  "schemas": {
+    "students": {
+      "table_name": "students",
+      "columns": [
+        {
+          "name": "id",
+          "data_type": "INT",
+          "not_null": false,
+          "unique": true
+        },
+        {
+          "name": "name",
+          "data_type": "STR",
+          "not_null": true,
+          "unique": false
+        },
+        {
+          "name": "marks",
+          "data_type": "INT",
+          "not_null": false,
+          "unique": false
+        }
+      ]
+    }
+  },
+  "next_rids": {
+    "students": 4
+  }
+}

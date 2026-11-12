@@ -1,0 +1,8 @@
+[
+  {
+    "index_name": "uq_students_id",
+    "table_name": "students",
+    "column_name": "id",
+    "index_type": "HASH"
+  }
+]
