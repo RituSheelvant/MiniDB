@@ -1,0 +1,32 @@
+# MiniDB — Custom Embeddable Database & Query Execution Engine
+
+MiniDB is a zero-dependency, embeddable Python database library featuring a custom binary storage format, custom lexer and recursive-descent query parser, multi-field Hash and B-Tree range indexes, a cost-based query planner, Write-Ahead Logging (WAL) crash recovery, and thread-safe concurrency.
+
+---
+
+## Architecture Overview
+
+1. **Storage Layer (`minidb/storage.py`)**: Stores table records in binary `.mdb` files using length-prefixed frames (`[CRC32 (4B) | Length (4B) | Tombstone (1B) | Payload]`) with `os.fsync()` durability and strict schema enforcement (`INT`, `FLOAT`, `STR`, `BOOL`, `NOT NULL`, `UNIQUE`).
+2. **Write-Ahead Log & Recovery (`minidb/wal.py`, `minidb/engine.py`)**: Implements a NO-STEAL / FORCE transaction protocol. All mutations are logged with CRC32 checksums before committing. Upon restart, committed transactions are replayed and incomplete/uncommitted transactions from hard crashes are discarded.
+3. **Custom Query Language & AST (`minidb/parser.py`)**: Hand-written regex tokenizer and recursive-descent parser (no external SQL parsing libraries). Supports `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT` (`WHERE` with `AND`/`OR`, `GROUP BY`, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `ORDER BY`, `LIMIT`), `UPDATE`, and `DELETE`.
+4. **Indexing & Query Planner (`minidb/index.py`)**: Implements `HashIndex` ($O(1)$ equality lookups) and `BTreeRangeIndex` ($O(\log N)$ binary-search range scans). `QueryPlanner` evaluates table cardinality and filter predicates to choose between `INDEX_SCAN` and `FULL_TABLE_SCAN`, returning telemetry (`execution_time_ms`, `records_scanned`, `index_used`).
+5. **Concurrency (`minidb/engine.py`)**: Uses a custom `ReadWriteLock` permitting parallel `SELECT` queries while serializing write transactions.
+
+---
+
+## Quick Usage Example
+
+```python
+from minidb import MiniDB
+
+db = MiniDB("./my_database")
+db.execute("CREATE TABLE users (id INT UNIQUE, name STR NOT NULL, age INT)")
+db.execute("CREATE INDEX idx_age ON users (age) USING BTREE")
+
+with db.transaction():
+    db.execute("INSERT INTO users VALUES (1, 'Alice', 28)")
+    db.execute("INSERT INTO users VALUES (2, 'Bob', 34)")
+
+result = db.execute("SELECT name, age FROM users WHERE age >= 30 ORDER BY age DESC")
+print(result["rows"])   # [{'name': 'Bob', 'age': 34}]
+print(result["stats"])  # {'strategy': 'INDEX_SCAN', 'records_scanned': 1, ...}
