@@ -1,4 +1,5 @@
-import copy
+﻿import copy
+import fnmatch
 import json
 import os
 import threading
@@ -14,10 +15,14 @@ from .parser import (
     CreateIndexStmt,
     CreateTableStmt,
     DeleteStmt,
+    DescribeTableStmt,
+    DropIndexStmt,
+    DropTableStmt,
     ExplainStmt,
     InsertStmt,
     SelectItem,
     SelectStmt,
+    ShowTablesStmt,
     UpdateStmt,
     VacuumStmt,
     WhereClause,
@@ -69,8 +74,8 @@ class ReadWriteLock:
 class MiniDB:
     """
     Embeddable custom database engine supporting custom query parsing,
-    multi-field & composite indexing, OR index unions, JOINs, WAL crash recovery,
-    and thread-safe concurrency.
+    multi-field & composite indexing, OR index unions, INNER/LEFT multi-table JOINs,
+    WAL crash recovery, and thread-safe concurrency.
     """
 
     def __init__(self, db_dir: str = "./minidb_data"):
@@ -84,7 +89,6 @@ class MiniDB:
         self.next_rids: Dict[str, int] = {}
         self.tables: Dict[str, Dict[int, Dict[str, Any]]] = {}
         self.offsets: Dict[str, Dict[int, int]] = {}
-        # table -> {tuple(columns): BaseIndex}
         self.indexes: Dict[str, Dict[Tuple[str, ...], BaseIndex]] = {}
         self.index_meta: List[Dict[str, Any]] = []
 
@@ -126,6 +130,15 @@ class MiniDB:
                     self.tables[tbl] = {}
                     self.offsets[tbl] = {}
                     self.indexes[tbl] = {}
+            elif op == "DROP_TABLE":
+                self.schemas.pop(tbl, None)
+                self.next_rids.pop(tbl, None)
+                self.tables.pop(tbl, None)
+                self.offsets.pop(tbl, None)
+                self.indexes.pop(tbl, None)
+                mdb_path = self.storage._table_file(tbl)
+                if os.path.exists(mdb_path):
+                    os.remove(mdb_path)
             elif op == "INSERT" and tbl in self.tables:
                 rec = entry["after"]
                 rid = rec["_rid"]
@@ -146,11 +159,16 @@ class MiniDB:
         self.storage.save_catalog(self.schemas, self.next_rids)
         self.wal.truncate()
 
+        valid_meta = []
         for meta in self.index_meta:
             tbl = meta["table_name"]
             cols = meta.get("columns") or [meta["column_name"]]
             if tbl in self.schemas and all(c in self.schemas[tbl].col_map for c in cols):
                 self._build_index_in_memory(meta["index_name"], tbl, cols, meta["index_type"])
+                valid_meta.append(meta)
+        if len(valid_meta) != len(self.index_meta):
+            self.index_meta = valid_meta
+            self._save_index_meta()
 
         self.last_recovery_stats = {
             "replayed_committed_ops": len(committed_ops),
@@ -209,6 +227,10 @@ class MiniDB:
                 old_offset = self.offsets[tbl].pop(rid, None)
                 if old_offset is not None:
                     self.storage.mark_deleted(tbl, old_offset)
+            elif disk_op == "REMOVE_TABLE_FILE":
+                mdb_path = self.storage._table_file(tbl)
+                if os.path.exists(mdb_path):
+                    os.remove(mdb_path)
 
         if tx["catalog_changed"]:
             self.storage.save_catalog(self.schemas, self.next_rids)
@@ -274,6 +296,12 @@ class MiniDB:
         elif isinstance(stmt, ExplainStmt):
             with self.rwlock.read_lock():
                 result = self._exec_explain(stmt)
+        elif isinstance(stmt, ShowTablesStmt):
+            with self.rwlock.read_lock():
+                result = self._exec_show_tables()
+        elif isinstance(stmt, DescribeTableStmt):
+            with self.rwlock.read_lock():
+                result = self._exec_describe_table(stmt)
         elif isinstance(stmt, VacuumStmt):
             with self.rwlock.write_lock():
                 result = self._exec_vacuum(stmt)
@@ -285,8 +313,12 @@ class MiniDB:
                 try:
                     if isinstance(stmt, CreateTableStmt):
                         result = self._exec_create_table(stmt)
+                    elif isinstance(stmt, DropTableStmt):
+                        result = self._exec_drop_table(stmt)
                     elif isinstance(stmt, CreateIndexStmt):
                         result = self._exec_create_index(stmt)
+                    elif isinstance(stmt, DropIndexStmt):
+                        result = self._exec_drop_index(stmt)
                     elif isinstance(stmt, InsertStmt):
                         result = self._exec_insert(stmt)
                     elif isinstance(stmt, UpdateStmt):
@@ -307,30 +339,73 @@ class MiniDB:
         result.setdefault("stats", {})["execution_time_ms"] = elapsed_ms
         return result
 
-    # --- Utility & Maintenance Executors ---
+    # --- Introspection, Utility & Maintenance Executors ---
+
+    def _exec_show_tables(self) -> Dict[str, Any]:
+        tables_info = [
+            {
+                "table": tbl,
+                "rows": len(self.tables[tbl]),
+                "columns": len(self.schemas[tbl].columns),
+                "indexes": len(self.indexes.get(tbl, {})),
+            }
+            for tbl in sorted(self.schemas.keys())
+        ]
+        return {"status": "OK", "tables": tables_info}
+
+    def _exec_describe_table(self, stmt: DescribeTableStmt) -> Dict[str, Any]:
+        if stmt.table_name not in self.schemas:
+            raise ExecutionError(f"Table '{stmt.table_name}' does not exist.")
+        schema = self.schemas[stmt.table_name]
+        cols_info = [
+            {
+                "name": c.name,
+                "type": getattr(c, "data_type", getattr(c, "type", "STR")),
+                "not_null": c.not_null,
+                "unique": c.unique,
+            }
+            for c in schema.columns
+        ]
+        idx_info = [
+            {
+                "index_name": idx.index_name,
+                "columns": idx.columns,
+                "type": idx.index_type,
+            }
+            for idx in self.indexes.get(stmt.table_name, {}).values()
+        ]
+        return {
+            "status": "OK",
+            "table": stmt.table_name,
+            "row_count": len(self.tables[stmt.table_name]),
+            "columns": cols_info,
+            "indexes": idx_info,
+        }
 
     def _exec_explain(self, stmt: ExplainStmt) -> Dict[str, Any]:
         sel = stmt.select_stmt
         if sel.table_name not in self.schemas:
             raise ExecutionError(f"Table '{sel.table_name}' does not exist.")
-        if sel.join is not None:
-            if sel.join.right_table not in self.schemas:
-                raise ExecutionError(f"Joined table '{sel.join.right_table}' does not exist.")
-            r_col = sel.join.right_col.split(".")[-1]
-            has_right_idx = (r_col,) in self.indexes.get(sel.join.right_table, {})
-            join_algo = "INDEX_NESTED_LOOP_JOIN" if has_right_idx else "HASH_JOIN"
+        if sel.joins:
+            join_steps = []
+            for j in sel.joins:
+                if j.right_table not in self.schemas:
+                    raise ExecutionError(f"Joined table '{j.right_table}' does not exist.")
+                r_col = j.right_col.split(".")[-1]
+                has_right_idx = (r_col,) in self.indexes.get(j.right_table, {})
+                algo = "INDEX_NESTED_LOOP_JOIN" if has_right_idx else "HASH_JOIN"
+                join_steps.append({
+                    "join_type": j.join_type,
+                    "right_table": j.right_table,
+                    "condition": f"{j.left_col} = {j.right_col}",
+                    "algorithm": algo,
+                })
             return {
                 "status": "OK",
                 "plan": {
-                    "strategy": join_algo,
-                    "left_table": sel.table_name,
-                    "right_table": sel.join.right_table,
-                    "join_condition": f"{sel.join.left_col} = {sel.join.right_col}",
-                    "reason": (
-                        f"Using existing index on {sel.join.right_table}({r_col}) for O(1)/O(log N) probes."
-                        if has_right_idx
-                        else f"Building in-memory hash table on {sel.join.right_table}({r_col}) for O(N+M) join."
-                    ),
+                    "strategy": "MULTI_STAGE_JOIN",
+                    "base_table": sel.table_name,
+                    "join_pipeline": join_steps,
                 },
             }
 
@@ -407,6 +482,29 @@ class MiniDB:
 
         return {"status": "OK", "message": f"Table '{stmt.table_name}' created."}
 
+    def _exec_drop_table(self, stmt: DropTableStmt) -> Dict[str, Any]:
+        if self._get_tx_state() is not None and len(self._get_tx_state()["undo_log"]) > 0:
+            raise TransactionError("DROP TABLE cannot be combined with other operations inside an active transaction.")
+        if stmt.table_name not in self.schemas:
+            raise ExecutionError(f"Table '{stmt.table_name}' does not exist.")
+
+        tx = self._get_tx_state()
+        assert tx is not None
+        self.wal.append(tx_id=tx["tx_id"], op="DROP_TABLE", table=stmt.table_name)
+
+        self.schemas.pop(stmt.table_name, None)
+        self.next_rids.pop(stmt.table_name, None)
+        self.tables.pop(stmt.table_name, None)
+        self.offsets.pop(stmt.table_name, None)
+        self.indexes.pop(stmt.table_name, None)
+
+        self.index_meta = [m for m in self.index_meta if m["table_name"] != stmt.table_name]
+        self._save_index_meta()
+
+        tx["disk_writes"].append(("REMOVE_TABLE_FILE", stmt.table_name, -1, None))
+        tx["catalog_changed"] = True
+        return {"status": "OK", "message": f"Table '{stmt.table_name}' dropped."}
+
     def _exec_create_index(self, stmt: CreateIndexStmt) -> Dict[str, Any]:
         if stmt.table_name not in self.schemas:
             raise ExecutionError(f"Table '{stmt.table_name}' does not exist.")
@@ -436,6 +534,20 @@ class MiniDB:
             "status": "OK",
             "message": f"Index '{stmt.index_name}' ({stmt.index_type}) created on {stmt.table_name}({', '.join(stmt.columns)}).",
         }
+
+    def _exec_drop_index(self, stmt: DropIndexStmt) -> Dict[str, Any]:
+        found = False
+        for tbl, idx_map in list(self.indexes.items()):
+            for cols_key, idx_obj in list(idx_map.items()):
+                if idx_obj.index_name == stmt.index_name:
+                    del idx_map[cols_key]
+                    found = True
+        if not found:
+            raise ExecutionError(f"Index '{stmt.index_name}' does not exist.")
+
+        self.index_meta = [m for m in self.index_meta if m["index_name"] != stmt.index_name]
+        self._save_index_meta()
+        return {"status": "OK", "message": f"Index '{stmt.index_name}' dropped."}
 
     def _exec_insert(self, stmt: InsertStmt) -> Dict[str, Any]:
         if stmt.table_name not in self.schemas:
@@ -480,6 +592,14 @@ class MiniDB:
         lhs = row.get(cond.field)
         rhs = cond.value
         op = cond.op
+
+        if op == "IN":
+            return lhs in rhs
+        if op == "LIKE":
+            if not isinstance(lhs, str):
+                return False
+            glob_pat = rhs.replace("%", "*").replace("_", "?")
+            return fnmatch.fnmatchcase(lhs, glob_pat)
 
         if lhs is None or rhs is None:
             if op == "=":
@@ -627,115 +747,128 @@ class MiniDB:
         raise ExecutionError(f"Unsupported aggregation function '{func}'.")
 
     def _build_joined_rows(self, stmt: SelectStmt) -> Tuple[List[Dict[str, Any]], List[str], set, Dict[str, Any]]:
-        assert stmt.join is not None
-        left_tbl = stmt.table_name
-        right_tbl = stmt.join.right_table
+        base_tbl = stmt.table_name
+        if base_tbl not in self.schemas:
+            raise ExecutionError(f"Table '{base_tbl}' does not exist.")
 
-        if left_tbl not in self.schemas:
-            raise ExecutionError(f"Table '{left_tbl}' does not exist.")
-        if right_tbl not in self.schemas:
-            raise ExecutionError(f"Table '{right_tbl}' does not exist.")
+        base_schema = self.schemas[base_tbl]
+        current_rows: List[Dict[str, Any]] = []
+        for r in self.tables[base_tbl].values():
+            row_dict = {f"{base_tbl}.{c.name}": r.get(c.name) for c in base_schema.columns}
+            current_rows.append(row_dict)
 
-        left_schema = self.schemas[left_tbl]
-        right_schema = self.schemas[right_tbl]
+        included_tables = [base_tbl]
+        records_scanned = len(current_rows)
+        total_records = len(current_rows)
+        strategies_used: List[str] = []
+        indexes_used: List[str] = []
 
-        l_col = stmt.join.left_col.split(".")[-1]
-        r_col = stmt.join.right_col.split(".")[-1]
-        if l_col not in left_schema.col_map:
-            raise ExecutionError(f"Unknown join column '{stmt.join.left_col}'.")
-        if r_col not in right_schema.col_map:
-            raise ExecutionError(f"Unknown join column '{stmt.join.right_col}'.")
+        for j in stmt.joins:
+            right_tbl = j.right_table
+            if right_tbl not in self.schemas:
+                raise ExecutionError(f"Table '{right_tbl}' does not exist.")
+            right_schema = self.schemas[right_tbl]
+            r_col = j.right_col.split(".")[-1]
+            if r_col not in right_schema.col_map:
+                raise ExecutionError(f"Unknown join column '{j.right_col}'.")
 
-        left_rows = list(self.tables[left_tbl].values())
-        right_map = self.tables[right_tbl]
-        right_idx = self.indexes.get(right_tbl, {}).get((r_col,))
+            right_map = self.tables[right_tbl]
+            total_records += len(right_map)
+            right_idx = self.indexes.get(right_tbl, {}).get((r_col,))
+            null_right_template = {f"{right_tbl}.{c.name}": None for c in right_schema.columns}
 
-        # Build list of output column keys (qualified + unambiguous unqualified)
+            next_rows: List[Dict[str, Any]] = []
+
+            if right_idx is not None:
+                strategies_used.append(("LEFT_" if j.join_type == "LEFT" else "") + "INDEX_NESTED_LOOP_JOIN")
+                indexes_used.append(f"{right_idx.index_name}({right_tbl}.{r_col})")
+                for lrow in current_rows:
+                    l_val = lrow.get(j.left_col) if "." in j.left_col else self._resolve_unqualified(lrow, j.left_col, included_tables)
+                    matched_rids = (right_idx.lookup("=", l_val) or set()) if l_val is not None else set()
+                    records_scanned += len(matched_rids)
+                    if matched_rids:
+                        for rrid in matched_rids:
+                            rrow = right_map.get(rrid)
+                            if rrow is not None:
+                                merged = dict(lrow)
+                                for c in right_schema.columns:
+                                    merged[f"{right_tbl}.{c.name}"] = rrow.get(c.name)
+                                next_rows.append(merged)
+                    elif j.join_type == "LEFT":
+                        merged = dict(lrow)
+                        merged.update(null_right_template)
+                        next_rows.append(merged)
+            else:
+                strategies_used.append(("LEFT_" if j.join_type == "LEFT" else "") + "HASH_JOIN")
+                hash_buckets: Dict[Any, List[Dict[str, Any]]] = {}
+                for rrow in right_map.values():
+                    records_scanned += 1
+                    kv = rrow.get(r_col)
+                    if kv is not None:
+                        hash_buckets.setdefault(kv, []).append(rrow)
+
+                for lrow in current_rows:
+                    l_val = lrow.get(j.left_col) if "." in j.left_col else self._resolve_unqualified(lrow, j.left_col, included_tables)
+                    matches = hash_buckets.get(l_val, []) if l_val is not None else []
+                    if matches:
+                        for rrow in matches:
+                            merged = dict(lrow)
+                            for c in right_schema.columns:
+                                merged[f"{right_tbl}.{c.name}"] = rrow.get(c.name)
+                            next_rows.append(merged)
+                    elif j.join_type == "LEFT":
+                        merged = dict(lrow)
+                        merged.update(null_right_template)
+                        next_rows.append(merged)
+
+            current_rows = next_rows
+            included_tables.append(right_tbl)
+
+        # Populate unambiguous unqualified column aliases across all joined tables
+        col_counts: Dict[str, int] = {}
+        for tbl in included_tables:
+            for c in self.schemas[tbl].columns:
+                col_counts[c.name] = col_counts.get(c.name, 0) + 1
+
         all_star_cols: List[str] = []
         valid_fields: set = set()
-        for c in left_schema.columns:
-            q = f"{left_tbl}.{c.name}"
-            all_star_cols.append(q)
-            valid_fields.add(q)
-            if c.name not in right_schema.col_map:
-                valid_fields.add(c.name)
-        for c in right_schema.columns:
-            q = f"{right_tbl}.{c.name}"
-            all_star_cols.append(q)
-            valid_fields.add(q)
-            if c.name not in left_schema.col_map:
-                valid_fields.add(c.name)
+        for tbl in included_tables:
+            for c in self.schemas[tbl].columns:
+                q = f"{tbl}.{c.name}"
+                all_star_cols.append(q)
+                valid_fields.add(q)
+                if col_counts[c.name] == 1:
+                    valid_fields.add(c.name)
 
-        joined: List[Dict[str, Any]] = []
-        records_scanned = len(left_rows)
+        for row in current_rows:
+            for tbl in included_tables:
+                for c in self.schemas[tbl].columns:
+                    if col_counts[c.name] == 1:
+                        row[c.name] = row[f"{tbl}.{c.name}"]
 
-        if right_idx is not None:
-            # Index Nested-Loop Join
-            strategy = "INDEX_NESTED_LOOP_JOIN"
-            index_used = f"{right_idx.index_name}({right_idx.index_type} on {right_tbl}.{r_col})"
-            for lrow in left_rows:
-                key_val = lrow.get(l_col)
-                if key_val is None:
-                    continue
-                matched_rids = right_idx.lookup("=", key_val) or set()
-                records_scanned += len(matched_rids)
-                for rrid in matched_rids:
-                    rrow = right_map.get(rrid)
-                    if rrow is not None:
-                        merged: Dict[str, Any] = {}
-                        for k, v in lrow.items():
-                            if k != "_rid":
-                                merged[f"{left_tbl}.{k}"] = v
-                                if k not in right_schema.col_map:
-                                    merged[k] = v
-                        for k, v in rrow.items():
-                            if k != "_rid":
-                                merged[f"{right_tbl}.{k}"] = v
-                                if k not in left_schema.col_map:
-                                    merged[k] = v
-                        joined.append(merged)
-        else:
-            # In-Memory Hash Join
-            strategy = "HASH_JOIN"
-            index_used = None
-            hash_buckets: Dict[Any, List[Dict[str, Any]]] = {}
-            for rrow in right_map.values():
-                records_scanned += 1
-                kv = rrow.get(r_col)
-                if kv is not None:
-                    hash_buckets.setdefault(kv, []).append(rrow)
-
-            for lrow in left_rows:
-                kv = lrow.get(l_col)
-                if kv is not None and kv in hash_buckets:
-                    for rrow in hash_buckets[kv]:
-                        merged = {}
-                        for k, v in lrow.items():
-                            if k != "_rid":
-                                merged[f"{left_tbl}.{k}"] = v
-                                if k not in right_schema.col_map:
-                                    merged[k] = v
-                        for k, v in rrow.items():
-                            if k != "_rid":
-                                merged[f"{right_tbl}.{k}"] = v
-                                if k not in left_schema.col_map:
-                                    merged[k] = v
-                        joined.append(merged)
-
+        strategy_label = strategies_used[0] if len(strategies_used) == 1 else " -> ".join(strategies_used)
         stats = {
-            "strategy": strategy,
-            "index_used": index_used,
-            "planner_reason": f"Executed {strategy} on {left_tbl}.{l_col} = {right_tbl}.{r_col}.",
+            "strategy": strategy_label,
+            "index_used": ", ".join(indexes_used) if indexes_used else None,
+            "planner_reason": f"Joined {', '.join(included_tables)} using {strategy_label}.",
             "records_scanned": records_scanned,
-            "total_table_records": len(left_rows) + len(right_map),
+            "total_table_records": total_records,
         }
-        return joined, all_star_cols, valid_fields, stats
+        return current_rows, all_star_cols, valid_fields, stats
+
+    def _resolve_unqualified(self, row: Dict[str, Any], col: str, tables: List[str]) -> Any:
+        matches = [row[f"{t}.{col}"] for t in tables if f"{t}.{col}" in row]
+        if not matches:
+            raise ExecutionError(f"Unknown join column '{col}'.")
+        if len(matches) > 1:
+            raise ExecutionError(f"Ambiguous join column '{col}'; qualify as table.{col}.")
+        return matches[0]
 
     def _exec_select(self, stmt: SelectStmt) -> Dict[str, Any]:
         if stmt.table_name not in self.schemas:
             raise ExecutionError(f"Table '{stmt.table_name}' does not exist.")
 
-        if stmt.join is not None:
+        if stmt.joins:
             candidates, star_cols, valid_fields, scan_stats = self._build_joined_rows(stmt)
         else:
             schema = self.schemas[stmt.table_name]

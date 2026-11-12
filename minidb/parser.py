@@ -22,9 +22,10 @@ TOKEN_SPEC = [
 MASTER_REGEX = re.compile("|".join(f"(?P<{name}>{pattern})" for name, pattern in TOKEN_SPEC))
 
 KEYWORDS = {
-    "CREATE", "TABLE", "INDEX", "ON", "USING",
+    "CREATE", "DROP", "SHOW", "TABLES", "DESCRIBE",
+    "TABLE", "INDEX", "ON", "USING",
     "INSERT", "INTO", "VALUES",
-    "SELECT", "FROM", "JOIN", "INNER", "WHERE", "AND", "OR",
+    "SELECT", "FROM", "JOIN", "INNER", "LEFT", "WHERE", "AND", "OR", "IN", "LIKE",
     "GROUP", "BY", "ORDER", "ASC", "DESC", "LIMIT",
     "UPDATE", "SET", "DELETE",
     "EXPLAIN", "VACUUM",
@@ -80,11 +81,31 @@ class CreateTableStmt:
 
 
 @dataclass
+class DropTableStmt:
+    table_name: str
+
+
+@dataclass
 class CreateIndexStmt:
     index_name: str
     table_name: str
     columns: List[str]
     index_type: str
+
+
+@dataclass
+class DropIndexStmt:
+    index_name: str
+
+
+@dataclass
+class ShowTablesStmt:
+    pass
+
+
+@dataclass
+class DescribeTableStmt:
+    table_name: str
 
 
 @dataclass
@@ -109,6 +130,7 @@ class WhereClause:
 
 @dataclass
 class JoinClause:
+    join_type: str  # "INNER" or "LEFT"
     right_table: str
     left_col: str
     right_col: str
@@ -126,7 +148,7 @@ class SelectItem:
 class SelectStmt:
     items: List[SelectItem]
     table_name: str
-    join: Optional[JoinClause]
+    joins: List[JoinClause]
     where: Optional[WhereClause]
     group_by: Optional[str]
     order_by: Optional[Tuple[str, bool]]
@@ -187,7 +209,6 @@ class Parser:
         raise QuerySyntaxError(f"Expected {tok_type}, got {self.current().type} ({self.current().value!r}) at pos {self.current().pos}.")
 
     def _parse_col_ref(self) -> str:
-        """Parses 'col' or 'table.col'."""
         first = self.expect_type("IDENT").value
         if self.current().type == "DOT":
             self.advance()
@@ -203,6 +224,15 @@ class Parser:
         cmd = tok.value
         if cmd == "CREATE":
             stmt = self._parse_create()
+        elif cmd == "DROP":
+            stmt = self._parse_drop()
+        elif cmd == "SHOW":
+            self.advance()
+            self.expect_keyword("TABLES")
+            stmt = ShowTablesStmt()
+        elif cmd == "DESCRIBE":
+            self.advance()
+            stmt = DescribeTableStmt(table_name=self.expect_type("IDENT").value)
         elif cmd == "INSERT":
             stmt = self._parse_insert()
         elif cmd == "SELECT":
@@ -216,8 +246,7 @@ class Parser:
             stmt = ExplainStmt(select_stmt=self._parse_select())
         elif cmd == "VACUUM":
             self.advance()
-            table_name = self.expect_type("IDENT").value
-            stmt = VacuumStmt(table_name=table_name)
+            stmt = VacuumStmt(table_name=self.expect_type("IDENT").value)
         else:
             raise QuerySyntaxError(f"Unsupported statement starting with '{cmd}'.")
 
@@ -243,6 +272,14 @@ class Parser:
             self.advance()
             return None
         raise QuerySyntaxError(f"Expected literal value, got {tok.value!r} at pos {tok.pos}.")
+
+    def _parse_drop(self) -> Any:
+        self.expect_keyword("DROP")
+        if self.match_keyword("TABLE"):
+            return DropTableStmt(table_name=self.expect_type("IDENT").value)
+        elif self.match_keyword("INDEX"):
+            return DropIndexStmt(index_name=self.expect_type("IDENT").value)
+        raise QuerySyntaxError("Expected TABLE or INDEX after DROP.")
 
     def _parse_create(self) -> Any:
         self.expect_keyword("CREATE")
@@ -331,9 +368,26 @@ class Parser:
 
         while True:
             field = self._parse_col_ref()
-            op_tok = self.expect_type("OP")
-            val = self._parse_literal()
-            conditions.append(Condition(field=field, op=op_tok.value, value=val))
+            if self.match_keyword("IN"):
+                self.expect_type("LPAREN")
+                in_vals: List[Any] = []
+                while True:
+                    in_vals.append(self._parse_literal())
+                    if self.current().type == "COMMA":
+                        self.advance()
+                    else:
+                        break
+                self.expect_type("RPAREN")
+                conditions.append(Condition(field=field, op="IN", value=in_vals))
+            elif self.match_keyword("LIKE"):
+                pattern = self._parse_literal()
+                if not isinstance(pattern, str):
+                    raise QuerySyntaxError("LIKE operator requires a string pattern.")
+                conditions.append(Condition(field=field, op="LIKE", value=pattern))
+            else:
+                op_tok = self.expect_type("OP")
+                val = self._parse_literal()
+                conditions.append(Condition(field=field, op=op_tok.value, value=val))
 
             if self.current().type == "KEYWORD" and self.current().value in ("AND", "OR"):
                 connectors.append(self.advance().value)
@@ -373,8 +427,13 @@ class Parser:
         self.expect_keyword("FROM")
         table_name = self.expect_type("IDENT").value
 
-        join: Optional[JoinClause] = None
-        if self.match_keyword("INNER") or (self.current().type == "KEYWORD" and self.current().value == "JOIN"):
+        joins: List[JoinClause] = []
+        while self.current().type == "KEYWORD" and self.current().value in ("JOIN", "INNER", "LEFT"):
+            join_type = "INNER"
+            if self.match_keyword("LEFT"):
+                join_type = "LEFT"
+            elif self.match_keyword("INNER"):
+                join_type = "INNER"
             self.expect_keyword("JOIN")
             right_table = self.expect_type("IDENT").value
             self.expect_keyword("ON")
@@ -383,7 +442,7 @@ class Parser:
             if op.value != "=":
                 raise QuerySyntaxError(f"JOIN ON clause only supports '=' equality, got {op.value!r}.")
             right_col = self._parse_col_ref()
-            join = JoinClause(right_table=right_table, left_col=left_col, right_col=right_col)
+            joins.append(JoinClause(join_type=join_type, right_table=right_table, left_col=left_col, right_col=right_col))
 
         where = self._parse_where()
 
@@ -422,7 +481,7 @@ class Parser:
         return SelectStmt(
             items=items,
             table_name=table_name,
-            join=join,
+            joins=joins,
             where=where,
             group_by=group_by,
             order_by=order_by,

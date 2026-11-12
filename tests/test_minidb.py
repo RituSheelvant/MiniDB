@@ -132,6 +132,43 @@ class TestMiniDB(unittest.TestCase):
         self.assertEqual(len(inlj["rows"]), 2)
         self.assertEqual(inlj["rows"][0]["orders.total"], 150.0)
 
+    def test_left_joins_and_chained_three_way_joins(self):
+        self.db.execute("CREATE TABLE users (id INT UNIQUE, name STR)")
+        self.db.execute("CREATE TABLE orders (oid INT UNIQUE, user_id INT, prod_id INT)")
+        self.db.execute("CREATE TABLE products (pid INT UNIQUE, title STR)")
+
+        self.db.execute("INSERT INTO users VALUES (1, 'Sheel')")
+        self.db.execute("INSERT INTO users VALUES (2, 'Riya')")  # Has no orders
+        self.db.execute("INSERT INTO products VALUES (10, 'Mechanical Keyboard')")
+        self.db.execute("INSERT INTO orders VALUES (100, 1, 10)")
+
+        res = self.db.execute(
+            "SELECT users.name, products.title FROM users "
+            "LEFT JOIN orders ON users.id = orders.user_id "
+            "LEFT JOIN products ON orders.prod_id = products.pid "
+            "ORDER BY users.id ASC"
+        )
+        self.assertEqual(res["rows"], [
+            {"users.name": "Sheel", "products.title": "Mechanical Keyboard"},
+            {"users.name": "Riya", "products.title": None},
+        ])
+
+    def test_ddl_introspection_drop_and_like_in_operators(self):
+        self.db.execute("CREATE TABLE courses (code STR UNIQUE, title STR)")
+        self.db.execute("INSERT INTO courses VALUES ('CS101', 'Intro to Systems')")
+        self.db.execute("INSERT INTO courses VALUES ('CS302', 'Database Internals')")
+        self.db.execute("INSERT INTO courses VALUES ('MA201', 'Linear Algebra')")
+
+        self.assertEqual(len(self.db.execute("SHOW TABLES")["tables"]), 1)
+        desc = self.db.execute("DESCRIBE courses")
+        self.assertEqual(desc["row_count"], 3)
+
+        res = self.db.execute("SELECT code FROM courses WHERE code LIKE 'CS%' AND code IN ('CS101', 'CS302', 'MA201')")
+        self.assertEqual(len(res["rows"]), 2)
+
+        self.db.execute("DROP TABLE courses")
+        self.assertEqual(self.db.execute("SHOW TABLES")["tables"], [])
+
     def test_vacuum_compaction_and_crc_corruption_detection(self):
         self.db.execute("CREATE TABLE logs (id INT UNIQUE, msg STR)")
         for i in range(1, 11):
