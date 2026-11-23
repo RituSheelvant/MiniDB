@@ -7,6 +7,8 @@ TOKEN_SPEC = [
     ("FLOAT", r"-?\d+\.\d+"),
     ("INT", r"-?\d+"),
     ("STRING", r"'([^']*)'"),
+    ("NAMED_PARAM", r":[A-Za-z_][A-Za-z0-9_]*"),
+    ("QMARK", r"\?"),
     ("OP", r"!=|<=|>=|=|<|>"),
     ("COMMA", r","),
     ("DOT", r"\."),
@@ -22,11 +24,13 @@ TOKEN_SPEC = [
 MASTER_REGEX = re.compile("|".join(f"(?P<{name}>{pattern})" for name, pattern in TOKEN_SPEC))
 
 KEYWORDS = {
-    "CREATE", "DROP", "SHOW", "TABLES", "DESCRIBE",
+    "CREATE", "DROP", "ALTER", "ADD", "RENAME", "COLUMN", "TO", "DEFAULT",
+    "REFERENCES", "CASCADE", "RESTRICT",
+    "SHOW", "TABLES", "DESCRIBE",
     "TABLE", "INDEX", "ON", "USING",
     "INSERT", "INTO", "VALUES",
-    "SELECT", "FROM", "JOIN", "INNER", "LEFT", "WHERE", "AND", "OR", "IN", "LIKE",
-    "GROUP", "BY", "ORDER", "ASC", "DESC", "LIMIT",
+    "SELECT", "DISTINCT", "AS", "FROM", "JOIN", "INNER", "LEFT", "WHERE", "AND", "OR", "IN", "LIKE",
+    "GROUP", "BY", "HAVING", "ORDER", "ASC", "DESC", "LIMIT",
     "UPDATE", "SET", "DELETE",
     "EXPLAIN", "VACUUM",
     "INT", "FLOAT", "STR", "BOOL",
@@ -59,6 +63,10 @@ def tokenize(query: str) -> List[Token]:
             tokens.append(Token("FLOAT", float(val), pos))
         elif kind == "STRING":
             tokens.append(Token("STRING", val[1:-1], pos))
+        elif kind == "NAMED_PARAM":
+            tokens.append(Token("NAMED_PARAM", val[1:], pos))
+        elif kind == "QMARK":
+            tokens.append(Token("QMARK", "?", pos))
         elif kind == "IDENT":
             upper = val.upper()
             if upper in KEYWORDS:
@@ -77,7 +85,19 @@ def tokenize(query: str) -> List[Token]:
 @dataclass
 class CreateTableStmt:
     table_name: str
-    columns: List[Tuple[str, str, bool, bool]]
+    # (col_name, data_type, not_null, unique, foreign_key_tuple)
+    columns: List[Tuple[str, str, bool, bool, Optional[Tuple[str, str, str]]]]
+
+
+@dataclass
+class AlterTableStmt:
+    table_name: str
+    action: str  # "ADD_COLUMN", "DROP_COLUMN", "RENAME_COLUMN"
+    column_def: Optional[Tuple[str, str, bool, bool, Optional[Tuple[str, str, str]]]] = None
+    default_value: Any = None
+    has_default: bool = False
+    column_name: Optional[str] = None
+    new_column_name: Optional[str] = None
 
 
 @dataclass
@@ -129,6 +149,21 @@ class WhereClause:
 
 
 @dataclass
+class HavingCondition:
+    target_type: str  # "AGG" or "COLUMN"
+    field: str
+    op: str
+    value: Any
+    func: Optional[str] = None
+
+
+@dataclass
+class HavingClause:
+    conditions: List[HavingCondition]
+    connectors: List[str]
+
+
+@dataclass
 class JoinClause:
     join_type: str  # "INNER" or "LEFT"
     right_table: str
@@ -151,8 +186,10 @@ class SelectStmt:
     joins: List[JoinClause]
     where: Optional[WhereClause]
     group_by: Optional[str]
+    having: Optional[HavingClause]
     order_by: Optional[Tuple[str, bool]]
     limit: Optional[int]
+    distinct: bool = False
 
 
 @dataclass
@@ -179,9 +216,11 @@ class VacuumStmt:
 
 
 class Parser:
-    def __init__(self, tokens: List[Token]):
+    def __init__(self, tokens: List[Token], params: Any = None):
         self.tokens = tokens
         self.pos = 0
+        self.params = params
+        self._param_idx = 0
 
     def current(self) -> Token:
         return self.tokens[self.pos]
@@ -216,6 +255,22 @@ class Parser:
             return f"{first}.{second}"
         return first
 
+    def _parse_references_clause(self) -> Tuple[str, str, str]:
+        ref_table = self.expect_type("IDENT").value
+        self.expect_type("LPAREN")
+        ref_col = self.expect_type("IDENT").value
+        self.expect_type("RPAREN")
+        on_delete = "RESTRICT"
+        if self.match_keyword("ON"):
+            self.expect_keyword("DELETE")
+            if self.match_keyword("CASCADE"):
+                on_delete = "CASCADE"
+            elif self.match_keyword("RESTRICT"):
+                on_delete = "RESTRICT"
+            else:
+                raise QuerySyntaxError("Expected CASCADE or RESTRICT after ON DELETE.")
+        return (ref_table, ref_col, on_delete)
+
     def parse(self) -> Any:
         tok = self.current()
         if tok.type != "KEYWORD":
@@ -224,6 +279,8 @@ class Parser:
         cmd = tok.value
         if cmd == "CREATE":
             stmt = self._parse_create()
+        elif cmd == "ALTER":
+            stmt = self._parse_alter()
         elif cmd == "DROP":
             stmt = self._parse_drop()
         elif cmd == "SHOW":
@@ -255,10 +312,36 @@ class Parser:
 
         if self.current().type != "EOF":
             raise QuerySyntaxError(f"Unexpected trailing token {self.current().value!r} at pos {self.current().pos}.")
+
+        if isinstance(self.params, (list, tuple)) and self._param_idx != len(self.params):
+            raise QuerySyntaxError(
+                f"Too many parameters provided: expected {self._param_idx}, got {len(self.params)}."
+            )
+
         return stmt
 
     def _parse_literal(self) -> Any:
         tok = self.current()
+        if tok.type == "QMARK":
+            self.advance()
+            if not isinstance(self.params, (list, tuple)):
+                raise QuerySyntaxError("Positional '?' parameter requires a tuple or list of parameters.")
+            if self._param_idx >= len(self.params):
+                raise QuerySyntaxError(
+                    f"Missing value for positional parameter #{self._param_idx + 1} at pos {tok.pos}."
+                )
+            val = self.params[self._param_idx]
+            self._param_idx += 1
+            return val
+
+        if tok.type == "NAMED_PARAM":
+            self.advance()
+            if not isinstance(self.params, dict):
+                raise QuerySyntaxError(f"Named parameter ':{tok.value}' requires a dict of parameters.")
+            if tok.value not in self.params:
+                raise QuerySyntaxError(f"Missing parameter ':{tok.value}' in parameter dict.")
+            return self.params[tok.value]
+
         if tok.type in ("INT", "FLOAT", "STRING"):
             self.advance()
             return tok.value
@@ -273,6 +356,64 @@ class Parser:
             return None
         raise QuerySyntaxError(f"Expected literal value, got {tok.value!r} at pos {tok.pos}.")
 
+    def _parse_alter(self) -> AlterTableStmt:
+        self.expect_keyword("ALTER")
+        self.expect_keyword("TABLE")
+        table_name = self.expect_type("IDENT").value
+
+        if self.match_keyword("ADD"):
+            self.match_keyword("COLUMN")
+            col_name = self.expect_type("IDENT").value
+            type_tok = self.expect_type("KEYWORD")
+            if type_tok.value not in ("INT", "FLOAT", "STR", "BOOL"):
+                raise QuerySyntaxError(f"Invalid column type '{type_tok.value}'.")
+            not_null = False
+            unique = False
+            has_default = False
+            default_value = None
+            foreign_key = None
+            while self.current().type == "KEYWORD" and self.current().value in ("NOT", "UNIQUE", "DEFAULT", "REFERENCES"):
+                if self.match_keyword("NOT"):
+                    self.expect_keyword("NULL")
+                    not_null = True
+                elif self.match_keyword("UNIQUE"):
+                    unique = True
+                elif self.match_keyword("DEFAULT"):
+                    has_default = True
+                    default_value = self._parse_literal()
+                elif self.match_keyword("REFERENCES"):
+                    foreign_key = self._parse_references_clause()
+            return AlterTableStmt(
+                table_name=table_name,
+                action="ADD_COLUMN",
+                column_def=(col_name, type_tok.value, not_null, unique, foreign_key),
+                default_value=default_value,
+                has_default=has_default,
+            )
+
+        if self.match_keyword("DROP"):
+            self.match_keyword("COLUMN")
+            col_name = self.expect_type("IDENT").value
+            return AlterTableStmt(
+                table_name=table_name,
+                action="DROP_COLUMN",
+                column_name=col_name,
+            )
+
+        if self.match_keyword("RENAME"):
+            self.match_keyword("COLUMN")
+            old_col = self.expect_type("IDENT").value
+            self.expect_keyword("TO")
+            new_col = self.expect_type("IDENT").value
+            return AlterTableStmt(
+                table_name=table_name,
+                action="RENAME_COLUMN",
+                column_name=old_col,
+                new_column_name=new_col,
+            )
+
+        raise QuerySyntaxError("Expected ADD, DROP, or RENAME after ALTER TABLE.")
+
     def _parse_drop(self) -> Any:
         self.expect_keyword("DROP")
         if self.match_keyword("TABLE"):
@@ -286,7 +427,7 @@ class Parser:
         if self.match_keyword("TABLE"):
             table_name = self.expect_type("IDENT").value
             self.expect_type("LPAREN")
-            cols: List[Tuple[str, str, bool, bool]] = []
+            cols: List[Tuple[str, str, bool, bool, Optional[Tuple[str, str, str]]]] = []
             while True:
                 col_name = self.expect_type("IDENT").value
                 type_tok = self.expect_type("KEYWORD")
@@ -294,13 +435,16 @@ class Parser:
                     raise QuerySyntaxError(f"Invalid column type '{type_tok.value}'.")
                 not_null = False
                 unique = False
-                while self.current().type == "KEYWORD" and self.current().value in ("NOT", "UNIQUE"):
+                foreign_key = None
+                while self.current().type == "KEYWORD" and self.current().value in ("NOT", "UNIQUE", "REFERENCES"):
                     if self.match_keyword("NOT"):
                         self.expect_keyword("NULL")
                         not_null = True
                     elif self.match_keyword("UNIQUE"):
                         unique = True
-                cols.append((col_name, type_tok.value, not_null, unique))
+                    elif self.match_keyword("REFERENCES"):
+                        foreign_key = self._parse_references_clause()
+                cols.append((col_name, type_tok.value, not_null, unique, foreign_key))
                 if self.current().type == "COMMA":
                     self.advance()
                 else:
@@ -396,8 +540,45 @@ class Parser:
 
         return WhereClause(conditions=conditions, connectors=connectors)
 
+    def _parse_having(self) -> Optional[HavingClause]:
+        if not self.match_keyword("HAVING"):
+            return None
+        conditions: List[HavingCondition] = []
+        connectors: List[str] = []
+
+        while True:
+            if self.current().type == "KEYWORD" and self.current().value in ("COUNT", "SUM", "AVG", "MIN", "MAX"):
+                func = self.advance().value
+                self.expect_type("LPAREN")
+                if self.current().type == "STAR":
+                    self.advance()
+                    field = "*"
+                else:
+                    field = self._parse_col_ref()
+                self.expect_type("RPAREN")
+                op_tok = self.expect_type("OP")
+                val = self._parse_literal()
+                conditions.append(
+                    HavingCondition(target_type="AGG", field=field, op=op_tok.value, value=val, func=func)
+                )
+            else:
+                field = self._parse_col_ref()
+                op_tok = self.expect_type("OP")
+                val = self._parse_literal()
+                conditions.append(
+                    HavingCondition(target_type="COLUMN", field=field, op=op_tok.value, value=val)
+                )
+
+            if self.current().type == "KEYWORD" and self.current().value in ("AND", "OR"):
+                connectors.append(self.advance().value)
+            else:
+                break
+
+        return HavingClause(conditions=conditions, connectors=connectors)
+
     def _parse_select(self) -> SelectStmt:
         self.expect_keyword("SELECT")
+        distinct = self.match_keyword("DISTINCT")
         items: List[SelectItem] = []
 
         while True:
@@ -414,10 +595,15 @@ class Parser:
                     field = self._parse_col_ref()
                 self.expect_type("RPAREN")
                 alias = f"{func}({field})"
+                if self.match_keyword("AS"):
+                    alias = self.expect_type("IDENT").value
                 items.append(SelectItem(expr_type="AGG", field=field, func=func, alias=alias))
             else:
                 field = self._parse_col_ref()
-                items.append(SelectItem(expr_type="COLUMN", field=field, alias=field))
+                alias = field
+                if self.match_keyword("AS"):
+                    alias = self.expect_type("IDENT").value
+                items.append(SelectItem(expr_type="COLUMN", field=field, alias=alias))
 
             if self.current().type == "COMMA":
                 self.advance()
@@ -450,6 +636,10 @@ class Parser:
         if self.match_keyword("GROUP"):
             self.expect_keyword("BY")
             group_by = self._parse_col_ref()
+
+        having = self._parse_having()
+        if having is not None and group_by is None and not any(i.expr_type == "AGG" for i in items):
+            raise QuerySyntaxError("HAVING clause requires GROUP BY or aggregate functions in SELECT.")
 
         order_by: Optional[Tuple[str, bool]] = None
         if self.match_keyword("ORDER"):
@@ -484,8 +674,10 @@ class Parser:
             joins=joins,
             where=where,
             group_by=group_by,
+            having=having,
             order_by=order_by,
             limit=limit,
+            distinct=distinct,
         )
 
     def _parse_update(self) -> UpdateStmt:
@@ -515,6 +707,6 @@ class Parser:
         return DeleteStmt(table_name=table_name, where=where)
 
 
-def parse_query(query: str) -> Any:
+def parse_query(query: str, params: Any = None) -> Any:
     tokens = tokenize(query)
-    return Parser(tokens).parse()
+    return Parser(tokens, params=params).parse()

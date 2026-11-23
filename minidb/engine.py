@@ -2,15 +2,17 @@
 import fnmatch
 import json
 import os
+import shutil
 import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .errors import ExecutionError, SchemaError, TransactionError
 from .index import BaseIndex, BTreeRangeIndex, HashIndex, QueryPlanner
 from .parser import (
+    AlterTableStmt,
     Condition,
     CreateIndexStmt,
     CreateTableStmt,
@@ -19,6 +21,8 @@ from .parser import (
     DropIndexStmt,
     DropTableStmt,
     ExplainStmt,
+    HavingClause,
+    HavingCondition,
     InsertStmt,
     SelectItem,
     SelectStmt,
@@ -74,8 +78,10 @@ class ReadWriteLock:
 class MiniDB:
     """
     Embeddable custom database engine supporting custom query parsing,
+    parameterized queries, schema evolution (ALTER TABLE), foreign keys
+    (REFERENCES / ON DELETE CASCADE & RESTRICT), DISTINCT, HAVING, column aliases (AS),
     multi-field & composite indexing, OR index unions, INNER/LEFT multi-table JOINs,
-    WAL crash recovery, and thread-safe concurrency.
+    WAL crash recovery, thread-safe concurrency, and Pythonic helper APIs.
     """
 
     def __init__(self, db_dir: str = "./minidb_data"):
@@ -93,9 +99,35 @@ class MiniDB:
         self.index_meta: List[Dict[str, Any]] = []
 
         self._tx_local = threading.local()
+        self._closed = False
         self.last_recovery_stats: Dict[str, Any] = {}
 
         self._startup_and_recover()
+
+    def __enter__(self) -> "MiniDB":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._get_tx_state() is not None:
+            if exc_type is not None:
+                self.rollback()
+            else:
+                self.commit()
+        self.close()
+
+    def close(self) -> None:
+        """Flushes catalog metadata and marks the database handle closed."""
+        if self._closed:
+            return
+        with self.rwlock.write_lock():
+            if self._get_tx_state() is not None:
+                self.rollback()
+            self.storage.save_catalog(self.schemas, self.next_rids)
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ExecutionError("Cannot operate on a closed MiniDB instance.")
 
     def _get_tx_state(self) -> Optional[Dict[str, Any]]:
         return getattr(self._tx_local, "tx", None)
@@ -130,6 +162,13 @@ class MiniDB:
                     self.tables[tbl] = {}
                     self.offsets[tbl] = {}
                     self.indexes[tbl] = {}
+            elif op == "ALTER_TABLE":
+                if tbl in self.schemas and entry.get("schema"):
+                    new_schema = TableSchema.from_dict(entry["schema"])
+                    self.schemas[tbl] = new_schema
+                    after_rows = entry.get("after")
+                    if isinstance(after_rows, dict):
+                        self.tables[tbl] = {int(k): v for k, v in after_rows.items()}
             elif op == "DROP_TABLE":
                 self.schemas.pop(tbl, None)
                 self.next_rids.pop(tbl, None)
@@ -197,9 +236,70 @@ class MiniDB:
         self.indexes.setdefault(table_name, {})[tuple(columns)] = idx
         return idx
 
+    # --- Foreign Key Helpers ---
+
+    def _validate_foreign_key_definitions(self, table_name: str, cols: List[Column]) -> None:
+        for col in cols:
+            if not col.foreign_key:
+                continue
+            ref_tbl, ref_col, _ = col.foreign_key
+            if ref_tbl == table_name:
+                ref_col_obj = next((c for c in cols if c.name == ref_col), None)
+            else:
+                if ref_tbl not in self.schemas:
+                    raise SchemaError(
+                        f"Foreign key on '{table_name}.{col.name}' references non-existent table '{ref_tbl}'."
+                    )
+                ref_col_obj = self.schemas[ref_tbl].col_map.get(ref_col)
+
+            if ref_col_obj is None:
+                raise SchemaError(
+                    f"Foreign key on '{table_name}.{col.name}' references non-existent column '{ref_tbl}.{ref_col}'."
+                )
+            if not ref_col_obj.unique:
+                raise SchemaError(
+                    f"Foreign key target '{ref_tbl}.{ref_col}' must have a UNIQUE constraint."
+                )
+            if ref_col_obj.data_type != col.data_type:
+                raise SchemaError(
+                    f"Foreign key type mismatch: '{table_name}.{col.name}' ({col.data_type}) vs '{ref_tbl}.{ref_col}' ({ref_col_obj.data_type})."
+                )
+
+    def _check_foreign_key_values(self, schema: TableSchema, record: Dict[str, Any]) -> None:
+        for col in schema.columns:
+            if not col.foreign_key:
+                continue
+            val = record.get(col.name)
+            if val is None:
+                continue
+            ref_tbl, ref_col, _ = col.foreign_key
+            if ref_tbl not in self.tables:
+                raise SchemaError(f"Referenced parent table '{ref_tbl}' does not exist.")
+
+            ref_idx = self.indexes.get(ref_tbl, {}).get((ref_col,))
+            if ref_idx is not None:
+                matches = ref_idx.lookup("=", val) or set()
+                exists = any(rid in self.tables[ref_tbl] for rid in matches)
+            else:
+                exists = any(r.get(ref_col) == val for r in self.tables[ref_tbl].values())
+
+            if not exists:
+                raise SchemaError(
+                    f"Foreign key constraint failed on '{schema.table_name}.{col.name}': value {val!r} not found in '{ref_tbl}.{ref_col}'."
+                )
+
+    def _get_referencing_columns(self, parent_table: str) -> List[Tuple[str, Column]]:
+        refs: List[Tuple[str, Column]] = []
+        for child_tbl, child_schema in self.schemas.items():
+            for col in child_schema.columns:
+                if col.foreign_key and col.foreign_key[0] == parent_table:
+                    refs.append((child_tbl, col))
+        return refs
+
     # --- Transaction Management (NO-STEAL / FORCE WAL Protocol) ---
 
     def begin(self) -> str:
+        self._ensure_open()
         if self._get_tx_state() is not None:
             raise TransactionError("Nested transactions are not supported.")
         tx_id = str(uuid.uuid4())
@@ -227,6 +327,10 @@ class MiniDB:
                 old_offset = self.offsets[tbl].pop(rid, None)
                 if old_offset is not None:
                     self.storage.mark_deleted(tbl, old_offset)
+            elif disk_op == "REWRITE_TABLE":
+                rec_map = self.tables[tbl]
+                ordered_recs = [rec_map[k] for k in sorted(rec_map.keys())]
+                self.offsets[tbl] = self.storage.rewrite_table(tbl, ordered_recs)
             elif disk_op == "REMOVE_TABLE_FILE":
                 mdb_path = self.storage._table_file(tbl)
                 if os.path.exists(mdb_path):
@@ -284,11 +388,95 @@ class MiniDB:
                 self.rollback()
             raise
 
+    # --- Developer Ergonomics & Convenience APIs ---
+
+    def query(self, sql: str, params: Any = None) -> List[Dict[str, Any]]:
+        """Executes a SELECT query and returns the list of row dicts directly."""
+        res = self.execute(sql, params=params)
+        if "rows" not in res:
+            raise ExecutionError("query() can only be used with SELECT statements.")
+        return res["rows"]
+
+    def fetchall(self, sql: str, params: Any = None) -> List[Dict[str, Any]]:
+        """Alias for query(): returns all matching rows as a list of dicts."""
+        return self.query(sql, params=params)
+
+    def fetchone(self, sql: str, params: Any = None) -> Optional[Dict[str, Any]]:
+        """Executes a SELECT query and returns the first matching row dict, or None."""
+        rows = self.query(sql, params=params)
+        return rows[0] if rows else None
+
+    def scalar(self, sql: str, params: Any = None) -> Any:
+        """Executes a SELECT query and returns the first column of the first row, or None."""
+        row = self.fetchone(sql, params=params)
+        if not row:
+            return None
+        return next(iter(row.values()))
+
+    def executemany(self, sql: str, param_seq: Iterable[Any]) -> Dict[str, Any]:
+        """Executes a parameterized DML query across many parameter sets in one atomic transaction."""
+        self._ensure_open()
+        start_time = time.perf_counter()
+        total_affected = 0
+        batch_count = 0
+
+        with self.rwlock.write_lock():
+            auto_tx = self._get_tx_state() is None
+            if auto_tx:
+                self.begin()
+            try:
+                for p in param_seq:
+                    res = self.execute(sql, params=p)
+                    total_affected += res.get("rows_affected", 0)
+                    batch_count += 1
+                if auto_tx:
+                    self.commit()
+            except Exception:
+                if auto_tx and self._get_tx_state() is not None:
+                    self.rollback()
+                raise
+
+        elapsed_ms = round((time.perf_counter() - start_time) * 1000, 4)
+        return {
+            "status": "OK",
+            "batches": batch_count,
+            "rows_affected": total_affected,
+            "stats": {"execution_time_ms": elapsed_ms},
+        }
+
+    def backup(self, dest_dir: str, overwrite: bool = False) -> Dict[str, Any]:
+        """Creates a consistent point-in-time snapshot of all catalog, index, and .mdb table files."""
+        self._ensure_open()
+        if self._get_tx_state() is not None:
+            raise TransactionError("Cannot create a backup while a transaction is active.")
+
+        if os.path.exists(dest_dir):
+            if not overwrite:
+                raise ExecutionError(f"Backup destination '{dest_dir}' already exists (pass overwrite=True to replace).")
+            shutil.rmtree(dest_dir)
+
+        with self.rwlock.read_lock():
+            os.makedirs(dest_dir, exist_ok=True)
+            copied_files: List[str] = []
+            for fname in os.listdir(self.db_dir):
+                if fname.endswith(".mdb") or fname in ("catalog.meta.json", "indexes.meta.json"):
+                    src = os.path.join(self.db_dir, fname)
+                    if os.path.isfile(src):
+                        shutil.copy2(src, os.path.join(dest_dir, fname))
+                        copied_files.append(fname)
+
+        return {
+            "status": "OK",
+            "backup_dir": dest_dir,
+            "files_copied": sorted(copied_files),
+        }
+
     # --- Query Execution Entry Point ---
 
-    def execute(self, query: str) -> Dict[str, Any]:
+    def execute(self, query: str, params: Any = None) -> Dict[str, Any]:
+        self._ensure_open()
         start_time = time.perf_counter()
-        stmt = parse_query(query)
+        stmt = parse_query(query, params=params)
 
         if isinstance(stmt, SelectStmt):
             with self.rwlock.read_lock():
@@ -313,6 +501,8 @@ class MiniDB:
                 try:
                     if isinstance(stmt, CreateTableStmt):
                         result = self._exec_create_table(stmt)
+                    elif isinstance(stmt, AlterTableStmt):
+                        result = self._exec_alter_table(stmt)
                     elif isinstance(stmt, DropTableStmt):
                         result = self._exec_drop_table(stmt)
                     elif isinstance(stmt, CreateIndexStmt):
@@ -357,15 +547,18 @@ class MiniDB:
         if stmt.table_name not in self.schemas:
             raise ExecutionError(f"Table '{stmt.table_name}' does not exist.")
         schema = self.schemas[stmt.table_name]
-        cols_info = [
-            {
+        cols_info = []
+        for c in schema.columns:
+            col_entry: Dict[str, Any] = {
                 "name": c.name,
                 "type": getattr(c, "data_type", getattr(c, "type", "STR")),
                 "not_null": c.not_null,
                 "unique": c.unique,
             }
-            for c in schema.columns
-        ]
+            if c.foreign_key:
+                col_entry["references"] = f"{c.foreign_key[0]}({c.foreign_key[1]}) ON DELETE {c.foreign_key[2]}"
+            cols_info.append(col_entry)
+
         idx_info = [
             {
                 "index_name": idx.index_name,
@@ -452,7 +645,8 @@ class MiniDB:
         if stmt.table_name in self.schemas:
             raise SchemaError(f"Table '{stmt.table_name}' already exists.")
 
-        cols = [Column(name, dtype, nn, uq) for name, dtype, nn, uq in stmt.columns]
+        cols = [Column(name, dtype, nn, uq, fk) for name, dtype, nn, uq, fk in stmt.columns]
+        self._validate_foreign_key_definitions(stmt.table_name, cols)
         schema = TableSchema(stmt.table_name, cols)
 
         tx = self._get_tx_state()
@@ -482,11 +676,197 @@ class MiniDB:
 
         return {"status": "OK", "message": f"Table '{stmt.table_name}' created."}
 
+    def _exec_alter_table(self, stmt: AlterTableStmt) -> Dict[str, Any]:
+        if self._get_tx_state() is not None and len(self._get_tx_state()["undo_log"]) > 0:
+            raise TransactionError("ALTER TABLE cannot be combined with other operations inside an active transaction.")
+        tbl = stmt.table_name
+        if tbl not in self.schemas:
+            raise ExecutionError(f"Table '{tbl}' does not exist.")
+
+        old_schema = self.schemas[tbl]
+        tx = self._get_tx_state()
+        assert tx is not None
+
+        if stmt.action == "ADD_COLUMN":
+            assert stmt.column_def is not None
+            col_name, dtype, not_null, unique, foreign_key = stmt.column_def
+            if col_name in old_schema.col_map:
+                raise SchemaError(f"Column '{col_name}' already exists in table '{tbl}'.")
+
+            new_col = Column(col_name, dtype, not_null, unique, foreign_key)
+            all_cols = list(old_schema.columns) + [new_col]
+            self._validate_foreign_key_definitions(tbl, all_cols)
+            new_schema = TableSchema(tbl, all_cols)
+
+            fill_val = stmt.default_value if stmt.has_default else None
+            if fill_val is None and (not_null or unique) and len(self.tables[tbl]) > 0:
+                raise SchemaError(
+                    f"Cannot add NOT NULL or UNIQUE column '{col_name}' to non-empty table '{tbl}' without DEFAULT."
+                )
+
+            updated_rows: Dict[int, Dict[str, Any]] = {}
+            validated_list: List[Dict[str, Any]] = []
+            for rid in sorted(self.tables[tbl].keys()):
+                row_copy = copy.deepcopy(self.tables[tbl][rid])
+                row_copy[col_name] = fill_val
+                clean = new_schema.validate_and_coerce(row_copy, validated_list)
+                self._check_foreign_key_values(new_schema, clean)
+                clean["_rid"] = rid
+                validated_list.append(clean)
+                updated_rows[rid] = clean
+
+            self.wal.append(
+                tx_id=tx["tx_id"],
+                op="ALTER_TABLE",
+                table=tbl,
+                schema=new_schema.to_dict(),
+                after={str(k): v for k, v in updated_rows.items()},
+            )
+
+            self.schemas[tbl] = new_schema
+            self.tables[tbl] = updated_rows
+
+            if unique:
+                idx_name = f"uq_{tbl}_{col_name}"
+                self._build_index_in_memory(idx_name, tbl, [col_name], "HASH")
+                self.index_meta.append({
+                    "index_name": idx_name,
+                    "table_name": tbl,
+                    "columns": [col_name],
+                    "index_type": "HASH",
+                })
+                self._save_index_meta()
+
+            tx["disk_writes"].append(("REWRITE_TABLE", tbl, -1, None))
+            tx["catalog_changed"] = True
+            return {"status": "OK", "message": f"Added column '{col_name}' to '{tbl}'."}
+
+        elif stmt.action == "DROP_COLUMN":
+            col_name = stmt.column_name
+            assert col_name is not None
+            if col_name not in old_schema.col_map:
+                raise ExecutionError(f"Column '{col_name}' does not exist in table '{tbl}'.")
+            if len(old_schema.columns) <= 1:
+                raise SchemaError(f"Cannot drop the only remaining column '{col_name}' from table '{tbl}'.")
+
+            for child_tbl, child_col in self._get_referencing_columns(tbl):
+                if child_col.foreign_key and child_col.foreign_key[1] == col_name:
+                    raise SchemaError(
+                        f"Cannot drop column '{tbl}.{col_name}': referenced by foreign key '{child_tbl}.{child_col.name}'."
+                    )
+
+            remaining_cols = [c for c in old_schema.columns if c.name != col_name]
+            new_schema = TableSchema(tbl, remaining_cols)
+
+            updated_rows = {}
+            for rid, row in self.tables[tbl].items():
+                row_copy = copy.deepcopy(row)
+                row_copy.pop(col_name, None)
+                updated_rows[rid] = row_copy
+
+            self.wal.append(
+                tx_id=tx["tx_id"],
+                op="ALTER_TABLE",
+                table=tbl,
+                schema=new_schema.to_dict(),
+                after={str(k): v for k, v in updated_rows.items()},
+            )
+
+            self.schemas[tbl] = new_schema
+            self.tables[tbl] = updated_rows
+
+            for cols_key in list(self.indexes.get(tbl, {}).keys()):
+                if col_name in cols_key:
+                    del self.indexes[tbl][cols_key]
+            new_meta = [
+                m for m in self.index_meta
+                if not (m["table_name"] == tbl and col_name in (m.get("columns") or [m["column_name"]]))
+            ]
+            if len(new_meta) != len(self.index_meta):
+                self.index_meta = new_meta
+                self._save_index_meta()
+
+            tx["disk_writes"].append(("REWRITE_TABLE", tbl, -1, None))
+            tx["catalog_changed"] = True
+            return {"status": "OK", "message": f"Dropped column '{col_name}' from '{tbl}'."}
+
+        elif stmt.action == "RENAME_COLUMN":
+            old_col = stmt.column_name
+            new_col = stmt.new_column_name
+            assert old_col is not None and new_col is not None
+            if old_col not in old_schema.col_map:
+                raise ExecutionError(f"Column '{old_col}' does not exist in table '{tbl}'.")
+            if new_col in old_schema.col_map:
+                raise SchemaError(f"Column '{new_col}' already exists in table '{tbl}'.")
+
+            for child_tbl, child_col in self._get_referencing_columns(tbl):
+                if child_col.foreign_key and child_col.foreign_key[1] == old_col:
+                    raise SchemaError(
+                        f"Cannot rename column '{tbl}.{old_col}': referenced by foreign key '{child_tbl}.{child_col.name}'."
+                    )
+
+            new_cols = []
+            for c in old_schema.columns:
+                if c.name == old_col:
+                    new_cols.append(Column(new_col, c.data_type, c.not_null, c.unique, c.foreign_key))
+                else:
+                    new_cols.append(c)
+            new_schema = TableSchema(tbl, new_cols)
+
+            updated_rows = {}
+            for rid, row in self.tables[tbl].items():
+                row_copy = copy.deepcopy(row)
+                row_copy[new_col] = row_copy.pop(old_col, None)
+                updated_rows[rid] = row_copy
+
+            self.wal.append(
+                tx_id=tx["tx_id"],
+                op="ALTER_TABLE",
+                table=tbl,
+                schema=new_schema.to_dict(),
+                after={str(k): v for k, v in updated_rows.items()},
+            )
+
+            self.schemas[tbl] = new_schema
+            self.tables[tbl] = updated_rows
+
+            meta_changed = False
+            for m in self.index_meta:
+                if m["table_name"] == tbl:
+                    cols_list = m.get("columns") or [m["column_name"]]
+                    if old_col in cols_list:
+                        old_key = tuple(cols_list)
+                        self.indexes.get(tbl, {}).pop(old_key, None)
+                        renamed_cols = [new_col if c == old_col else c for c in cols_list]
+                        m["columns"] = renamed_cols
+                        m.pop("column_name", None)
+                        self._build_index_in_memory(m["index_name"], tbl, renamed_cols, m["index_type"])
+                        meta_changed = True
+            if meta_changed:
+                self._save_index_meta()
+
+            tx["disk_writes"].append(("REWRITE_TABLE", tbl, -1, None))
+            tx["catalog_changed"] = True
+            return {"status": "OK", "message": f"Renamed column '{old_col}' to '{new_col}' in '{tbl}'."}
+
+        raise ExecutionError(f"Unsupported ALTER TABLE action '{stmt.action}'.")
+
     def _exec_drop_table(self, stmt: DropTableStmt) -> Dict[str, Any]:
         if self._get_tx_state() is not None and len(self._get_tx_state()["undo_log"]) > 0:
             raise TransactionError("DROP TABLE cannot be combined with other operations inside an active transaction.")
         if stmt.table_name not in self.schemas:
             raise ExecutionError(f"Table '{stmt.table_name}' does not exist.")
+
+        refs = [
+            (child_tbl, col.name)
+            for child_tbl, col in self._get_referencing_columns(stmt.table_name)
+            if child_tbl != stmt.table_name
+        ]
+        if refs:
+            child_tbl, child_col = refs[0]
+            raise SchemaError(
+                f"Cannot drop table '{stmt.table_name}': referenced by foreign key '{child_tbl}.{child_col}'."
+            )
 
         tx = self._get_tx_state()
         assert tx is not None
@@ -567,6 +947,7 @@ class MiniDB:
 
         existing = list(self.tables[stmt.table_name].values())
         clean_rec = schema.validate_and_coerce(raw_rec, existing)
+        self._check_foreign_key_values(schema, clean_rec)
 
         rid = self.next_rids[stmt.table_name]
         self.next_rids[stmt.table_name] = rid + 1
@@ -586,21 +967,7 @@ class MiniDB:
 
         return {"status": "OK", "rows_affected": 1, "rid": rid}
 
-    def _evaluate_condition(self, row: Dict[str, Any], cond: Condition, valid_fields: set) -> bool:
-        if cond.field not in valid_fields:
-            raise ExecutionError(f"Unknown column '{cond.field}' in WHERE clause.")
-        lhs = row.get(cond.field)
-        rhs = cond.value
-        op = cond.op
-
-        if op == "IN":
-            return lhs in rhs
-        if op == "LIKE":
-            if not isinstance(lhs, str):
-                return False
-            glob_pat = rhs.replace("%", "*").replace("_", "?")
-            return fnmatch.fnmatchcase(lhs, glob_pat)
-
+    def _compare_values(self, lhs: Any, op: str, rhs: Any) -> bool:
         if lhs is None or rhs is None:
             if op == "=":
                 return lhs is None and rhs is None
@@ -621,6 +988,23 @@ class MiniDB:
         elif op == ">=":
             return lhs >= rhs
         raise ExecutionError(f"Unsupported operator '{op}'.")
+
+    def _evaluate_condition(self, row: Dict[str, Any], cond: Condition, valid_fields: set) -> bool:
+        if cond.field not in valid_fields:
+            raise ExecutionError(f"Unknown column '{cond.field}' in WHERE clause.")
+        lhs = row.get(cond.field)
+        rhs = cond.value
+        op = cond.op
+
+        if op == "IN":
+            return lhs in rhs
+        if op == "LIKE":
+            if not isinstance(lhs, str):
+                return False
+            glob_pat = rhs.replace("%", "*").replace("_", "?")
+            return fnmatch.fnmatchcase(lhs, glob_pat)
+
+        return self._compare_values(lhs, op, rhs)
 
     def _matches_where(self, row: Dict[str, Any], where: Optional[WhereClause], valid_fields: set) -> bool:
         if where is None or not where.conditions:
@@ -665,7 +1049,9 @@ class MiniDB:
         tx = self._get_tx_state()
         assert tx is not None
 
+        referencing_cols = self._get_referencing_columns(stmt.table_name)
         updated_count = 0
+
         for old_row in matched_rows:
             rid = old_row["_rid"]
             candidate_copy = copy.deepcopy(old_row)
@@ -676,7 +1062,22 @@ class MiniDB:
 
             existing_others = list(self.tables[stmt.table_name].values())
             validated = schema.validate_and_coerce(candidate_copy, existing_others, ignore_row_id=rid)
+            self._check_foreign_key_values(schema, validated)
             validated["_rid"] = rid
+
+            for child_tbl, child_col in referencing_cols:
+                assert child_col.foreign_key is not None
+                ref_col = child_col.foreign_key[1]
+                if old_row.get(ref_col) != validated.get(ref_col):
+                    in_use = any(
+                        cr.get(child_col.name) == old_row.get(ref_col)
+                        for cr in self.tables.get(child_tbl, {}).values()
+                        if not (child_tbl == stmt.table_name and cr.get("_rid") == rid)
+                    )
+                    if in_use:
+                        raise SchemaError(
+                            f"Cannot update '{stmt.table_name}.{ref_col}': value {old_row.get(ref_col)!r} is referenced by '{child_tbl}.{child_col.name}'."
+                        )
 
             self.wal.append(tx_id=tx["tx_id"], op="UPDATE", table=stmt.table_name, before=old_row, after=validated)
 
@@ -692,6 +1093,51 @@ class MiniDB:
 
         return {"status": "OK", "rows_affected": updated_count, "stats": scan_stats}
 
+    def _delete_rows_with_fk(self, table_name: str, rows_to_delete: List[Dict[str, Any]], tx: Dict[str, Any], visited: Optional[set] = None) -> int:
+        if visited is None:
+            visited = set()
+
+        referencing_cols = self._get_referencing_columns(table_name)
+        deleted_total = 0
+
+        for old_row in rows_to_delete:
+            rid = old_row["_rid"]
+            state_key = (table_name, rid)
+            if state_key in visited or rid not in self.tables.get(table_name, {}):
+                continue
+            visited.add(state_key)
+
+            for child_tbl, child_col in referencing_cols:
+                assert child_col.foreign_key is not None
+                _, ref_col, on_delete = child_col.foreign_key
+                parent_val = old_row.get(ref_col)
+                if parent_val is None:
+                    continue
+
+                child_matches = [
+                    cr for cr in list(self.tables.get(child_tbl, {}).values())
+                    if cr.get(child_col.name) == parent_val
+                    and not (child_tbl == table_name and cr.get("_rid") == rid)
+                ]
+                if child_matches:
+                    if on_delete == "CASCADE":
+                        deleted_total += self._delete_rows_with_fk(child_tbl, child_matches, tx, visited)
+                    else:
+                        raise SchemaError(
+                            f"Cannot delete from '{table_name}': row with {ref_col}={parent_val!r} is referenced by '{child_tbl}.{child_col.name}'."
+                        )
+
+            self.wal.append(tx_id=tx["tx_id"], op="DELETE", table=table_name, before=old_row)
+            self.tables[table_name].pop(rid, None)
+            for idx in self.indexes.get(table_name, {}).values():
+                idx.remove(idx.extract_key(old_row), rid)
+
+            tx["disk_writes"].append(("DELETE", table_name, rid, None))
+            tx["undo_log"].append(("UNDO_DELETE", table_name, rid, copy.deepcopy(old_row)))
+            deleted_total += 1
+
+        return deleted_total
+
     def _exec_delete(self, stmt: DeleteStmt) -> Dict[str, Any]:
         if stmt.table_name not in self.schemas:
             raise ExecutionError(f"Table '{stmt.table_name}' does not exist.")
@@ -703,25 +1149,10 @@ class MiniDB:
         tx = self._get_tx_state()
         assert tx is not None
 
-        deleted_count = 0
-        for old_row in matched_rows:
-            rid = old_row["_rid"]
-            self.wal.append(tx_id=tx["tx_id"], op="DELETE", table=stmt.table_name, before=old_row)
-
-            self.tables[stmt.table_name].pop(rid, None)
-            for idx in self.indexes.get(stmt.table_name, {}).values():
-                idx.remove(idx.extract_key(old_row), rid)
-
-            tx["disk_writes"].append(("DELETE", stmt.table_name, rid, None))
-            tx["undo_log"].append(("UNDO_DELETE", stmt.table_name, rid, copy.deepcopy(old_row)))
-            deleted_count += 1
-
+        deleted_count = self._delete_rows_with_fk(stmt.table_name, matched_rows, tx)
         return {"status": "OK", "rows_affected": deleted_count, "stats": scan_stats}
 
-    def _compute_agg(self, item: SelectItem, rows: List[Dict[str, Any]], valid_fields: set) -> Any:
-        func = item.func
-        field = item.field
-
+    def _compute_agg_values(self, func: str, field: str, rows: List[Dict[str, Any]], valid_fields: set) -> Any:
         if func == "COUNT":
             if field == "*":
                 return len(rows)
@@ -745,6 +1176,56 @@ class MiniDB:
         elif func == "MAX":
             return max(vals)
         raise ExecutionError(f"Unsupported aggregation function '{func}'.")
+
+    def _compute_agg(self, item: SelectItem, rows: List[Dict[str, Any]], valid_fields: set) -> Any:
+        assert item.func is not None and item.field is not None
+        return self._compute_agg_values(item.func, item.field, rows, valid_fields)
+
+    def _evaluate_having_cond(
+        self,
+        cond: HavingCondition,
+        grp_key: Any,
+        grp_rows: List[Dict[str, Any]],
+        out_row: Dict[str, Any],
+        group_by_col: Optional[str],
+        valid_fields: set,
+    ) -> bool:
+        if cond.target_type == "AGG":
+            assert cond.func is not None
+            lhs = self._compute_agg_values(cond.func, cond.field, grp_rows, valid_fields)
+        else:
+            if cond.field in out_row:
+                lhs = out_row[cond.field]
+            elif group_by_col is not None and cond.field == group_by_col:
+                lhs = grp_key
+            else:
+                raise ExecutionError(
+                    f"Column '{cond.field}' in HAVING must be in GROUP BY, an alias, or inside an aggregate function."
+                )
+        return self._compare_values(lhs, cond.op, cond.value)
+
+    def _matches_having(
+        self,
+        having: Optional[HavingClause],
+        grp_key: Any,
+        grp_rows: List[Dict[str, Any]],
+        out_row: Dict[str, Any],
+        group_by_col: Optional[str],
+        valid_fields: set,
+    ) -> bool:
+        if having is None or not having.conditions:
+            return True
+
+        result = self._evaluate_having_cond(having.conditions[0], grp_key, grp_rows, out_row, group_by_col, valid_fields)
+        for i, conn in enumerate(having.connectors):
+            next_val = self._evaluate_having_cond(
+                having.conditions[i + 1], grp_key, grp_rows, out_row, group_by_col, valid_fields
+            )
+            if conn == "AND":
+                result = result and next_val
+            elif conn == "OR":
+                result = result or next_val
+        return result
 
     def _build_joined_rows(self, stmt: SelectStmt) -> Tuple[List[Dict[str, Any]], List[str], set, Dict[str, Any]]:
         base_tbl = stmt.table_name
@@ -824,7 +1305,6 @@ class MiniDB:
             current_rows = next_rows
             included_tables.append(right_tbl)
 
-        # Populate unambiguous unqualified column aliases across all joined tables
         col_counts: Dict[str, int] = {}
         for tbl in included_tables:
             for c in self.schemas[tbl].columns:
@@ -901,10 +1381,13 @@ class MiniDB:
                             )
                         out_row[item.alias or item.field] = grp_key
                     elif item.expr_type == "AGG":
+                        assert item.alias is not None
                         out_row[item.alias] = self._compute_agg(item, grp_rows, valid_fields)
                     else:
                         raise ExecutionError("SELECT * cannot be combined with GROUP BY or aggregates.")
-                output_rows.append(out_row)
+
+                if self._matches_having(stmt.having, grp_key, grp_rows, out_row, stmt.group_by, valid_fields):
+                    output_rows.append(out_row)
         else:
             for r in filtered:
                 out_row = {}
@@ -915,8 +1398,18 @@ class MiniDB:
                     elif item.expr_type == "COLUMN":
                         if item.field not in valid_fields:
                             raise ExecutionError(f"Unknown column '{item.field}' in SELECT list.")
-                        out_row[item.field] = r.get(item.field)
+                        out_row[item.alias or item.field] = r.get(item.field)
                 output_rows.append(out_row)
+
+        if stmt.distinct:
+            seen_rows = set()
+            deduped: List[Dict[str, Any]] = []
+            for row in output_rows:
+                sig = tuple((k, type(v).__name__, v) for k, v in row.items())
+                if sig not in seen_rows:
+                    seen_rows.add(sig)
+                    deduped.append(row)
+            output_rows = deduped
 
         if stmt.order_by:
             sort_field, is_desc = stmt.order_by

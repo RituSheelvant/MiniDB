@@ -30,7 +30,14 @@ def safe_replace(src: str, dst: str) -> None:
 
 
 class Column:
-    def __init__(self, name: str, data_type: str, not_null: bool = False, unique: bool = False):
+    def __init__(
+        self,
+        name: str,
+        data_type: str,
+        not_null: bool = False,
+        unique: bool = False,
+        foreign_key: Optional[Tuple[str, str, str]] = None,
+    ):
         data_type = data_type.upper()
         if data_type not in SUPPORTED_TYPES:
             raise SchemaError(f"Unsupported column type '{data_type}'. Allowed: {list(SUPPORTED_TYPES.keys())}")
@@ -38,6 +45,8 @@ class Column:
         self.data_type = data_type
         self.not_null = not_null
         self.unique = unique
+        # (ref_table, ref_column, on_delete_action: "RESTRICT" | "CASCADE")
+        self.foreign_key = tuple(foreign_key) if foreign_key else None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -45,15 +54,19 @@ class Column:
             "data_type": self.data_type,
             "not_null": self.not_null,
             "unique": self.unique,
+            "foreign_key": list(self.foreign_key) if self.foreign_key else None,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Column":
+        fk_raw = data.get("foreign_key")
+        fk_tuple = (fk_raw[0], fk_raw[1], fk_raw[2]) if fk_raw else None
         return cls(
             name=data["name"],
             data_type=data["data_type"],
             not_null=data.get("not_null", False),
             unique=data.get("unique", False),
+            foreign_key=fk_tuple,
         )
 
 
