@@ -35,22 +35,27 @@ from .parser import (
 from .storage import BinaryStorageEngine, Column, TableSchema, safe_replace
 from .wal import WriteAheadLog
 
-
 class ReadWriteLock:
     """
     Allows multiple concurrent readers while guaranteeing exclusive access for writers.
-    Prevents reader/writer race conditions across threads.
+    Supports same-thread reentrant write locks (e.g., executemany -> execute) and
+    prevents reader/writer race conditions across threads.
     """
 
     def __init__(self):
         self._cond = threading.Condition(threading.RLock())
         self._readers = 0
-        self._writer = False
+        self._writer_thread: Optional[int] = None
+        self._write_depth = 0
 
     @contextmanager
     def read_lock(self):
+        tid = threading.get_ident()
         with self._cond:
-            while self._writer:
+            if self._writer_thread == tid:
+                yield
+                return
+            while self._writer_thread is not None:
                 self._cond.wait()
             self._readers += 1
         try:
@@ -63,18 +68,27 @@ class ReadWriteLock:
 
     @contextmanager
     def write_lock(self):
+        tid = threading.get_ident()
         with self._cond:
-            while self._writer or self._readers > 0:
+            if self._writer_thread == tid:
+                self._write_depth += 1
+                try:
+                    yield
+                finally:
+                    self._write_depth -= 1
+                return
+            while self._writer_thread is not None or self._readers > 0:
                 self._cond.wait()
-            self._writer = True
+            self._writer_thread = tid
+            self._write_depth = 1
         try:
             yield
         finally:
             with self._cond:
-                self._writer = False
-                self._cond.notify_all()
-
-
+                self._write_depth -= 1
+                if self._write_depth == 0:
+                    self._writer_thread = None
+                    self._cond.notify_all()
 class MiniDB:
     """
     Embeddable custom database engine supporting custom query parsing,
